@@ -8,7 +8,7 @@ from transformers import (
     LayoutLMv3Processor,
     LayoutLMv3ImageProcessor,
     LayoutLMv3TokenizerFast,
-    RobertaTokenizerFast,
+    RobertaTokenizer,
 )
 import json
 from PIL import Image
@@ -19,7 +19,6 @@ import numpy as np
 import os
 import pytorch_lightning as pl
 from typing import Union
-from data_preprocessing.squad.preprocess_squad import squad_load
 from data_preprocessing.squad.run_preprocess import create_visual_squad
 from typing import Dict, Union, List
 import configargparse
@@ -35,12 +34,10 @@ class SquadDataset(pl.LightningDataModule):
         seed: int,
         llmv3_max_length: int,
         roberta_max_length: int,
-        llmv3_stride: int,
-        roberta_stride: int,
-        num_workers:int,
+        num_workers: int,
         dataset_dir: str = V_SQUAD_DIR,
         llmv3_checkpoint: str = LLMv3_BACKBONE,
-        roberta_checkpoint: str = RoBERTa_BACKBONE
+        roberta_checkpoint: str = RoBERTa_BACKBONE,
     ):
         """
         :param model_name: LLMv3 or RoBERTa
@@ -60,10 +57,7 @@ class SquadDataset(pl.LightningDataModule):
         self.batch_size = batch_size
         self.dev_ratio = dev_ratio
         self.test_ratio = test_ratio
-        self.llmv3_max_length = llmv3_max_length
-        self.roberta_max_length = roberta_max_length
-        self.llmv3_stride = llmv3_stride
-        self.roberta_stride = roberta_stride
+
         self.num_workers = num_workers
 
         self.dataset_dir = dataset_dir
@@ -72,7 +66,7 @@ class SquadDataset(pl.LightningDataModule):
 
         if not os.path.exists(self.para_texts_path) or not os.path.exists(self.dataset_json_path):
             self.create_dataset()
-            
+
         self.para_texts_df = self.load_para_texts()
         self.dataset = self.load_dataset()
 
@@ -82,14 +76,17 @@ class SquadDataset(pl.LightningDataModule):
         self.model_name = model_name
         assert self.model_name in ["LLMv3", "RoBERTa"]
 
-        self.llmv3_tokenizer = LayoutLMv3TokenizerFast.from_pretrained(llmv3_checkpoint)
-        self.roberta_tokenizer = RobertaTokenizerFast.from_pretrained(roberta_checkpoint)
+        self.llmv3_max_length = llmv3_max_length
+        self.roberta_max_length = roberta_max_length
 
-        self.image_feature_extractor = LayoutLMv3ImageProcessor(
+        self.llmv3_tokenizer = LayoutLMv3TokenizerFast.from_pretrained(llmv3_checkpoint)
+        self.roberta_tokenizer = RobertaTokenizer.from_pretrained(roberta_checkpoint)
+
+        self.feature_extractor = LayoutLMv3ImageProcessor(
             apply_ocr=False, ocr_lang="eng"
         )
         self.processor = LayoutLMv3Processor(
-            self.image_feature_extractor, self.llmv3_tokenizer
+            self.feature_extractor, self.llmv3_tokenizer
         )
 
         self._prepare_examples = {
@@ -97,9 +94,10 @@ class SquadDataset(pl.LightningDataModule):
             "RoBERTa": self.prepare_RoBERTa_examples,
         }
 
+    @staticmethod
     def create_dataset(
-        self,
-        data_paths: List[str] = [TRAINSET_PATH, DEVSET_PATH],
+        train_data_path: str = TRAINSET_PATH,
+        dev_data_path: str = DEVSET_PATH,
         output_dir: str = V_SQUAD_DIR,
         doc_limit: Union[int, None] = DOC_LIMIT,
         zip_path: Union[str, None] = ZIP_PATH,
@@ -109,24 +107,16 @@ class SquadDataset(pl.LightningDataModule):
         size_factor: int = 1,
         max_token_length: int = 512,
         ignore_impossible: bool = True,
-        para_asset_type: str = "para_box"
+        para_asset_type: str = "para_box",
     ):
         """
         Calls create_visual_squad from src\data_preprocessing\squad\run_preprocess.py to create
         visual squad dataset.
         """
-        data = []
-        for data_path in data_paths:
-            data.extend(squad_load(data_path))
-
         create_visual_squad(
-            data=data,
+            train_data_path=train_data_path,
+            dev_data_path=dev_data_path,
             output_dir=output_dir,
-            llmv3_max_length=self.llmv3_max_length,
-            roberta_max_length=self.roberta_max_length,
-            llmv3_stride=self.llmv3_stride,
-            roberta_stride=self.roberta_stride,
-            batch_size=self.batch_size,
             doc_limit=doc_limit,
             zip_path=zip_path,
             html_version=html_version,
@@ -135,7 +125,7 @@ class SquadDataset(pl.LightningDataModule):
             size_factor=size_factor,
             max_token_length=max_token_length,
             ignore_impossible=ignore_impossible,
-            para_asset_type=para_asset_type
+            para_asset_type=para_asset_type,
         )
 
     def load_dataset(self) -> Dataset:
@@ -196,10 +186,7 @@ class SquadDataset(pl.LightningDataModule):
 
         questions = [example["question"].strip() for example in examples]
 
-        encoding = {"start_positions" : [example["answer_start_token_idx"] for example in examples]}
-        encoding["end_positions"] = [example["answer_end_token_idx"] for example in examples]
-
-        encoding.update(self.roberta_tokenizer(
+        encoding = self.roberta_tokenizer(
             questions,
             contexts,
             max_length=self.roberta_max_length,
@@ -207,12 +194,16 @@ class SquadDataset(pl.LightningDataModule):
             return_overflowing_tokens=False,
             return_offsets_mapping=False,
             padding="max_length",
-        ))
+        )
+
+        encoding["start_positions"] = [
+            example["answer_start"] + len(example["question"]) for example in examples
+        ]
+        encoding["end_positions"] = [
+            example["answer_end"] + len(example["question"]) for example in examples
+        ]
 
         encoding = {key: torch.LongTensor(value) for key, value in encoding.items()}
-
-        # Needed for calculating metrics:
-        encoding['answer_text'] = np.array([example["answer_text"].strip() for example in examples])
 
         return encoding
 
@@ -226,7 +217,7 @@ class SquadDataset(pl.LightningDataModule):
             encoded pixel values, start_positions and end_positions.
         """
         images = [
-            Image.open(os.path.join(SRC_DIRECTORY, example["image_path"]))
+            Image.open(os.path.join(os.getcwd(), example["image_path"]))
             for example in examples
         ]
         questions = [example["question"].strip() for example in examples]
@@ -234,17 +225,14 @@ class SquadDataset(pl.LightningDataModule):
         words, bboxes = list(), list()
         for example in examples:
             word_bboxes_path = os.path.join(
-                SRC_DIRECTORY, example["image_path"].replace(".png", ".json")
+                os.getcwd(), example["image_path"].replace(".png", ".json")
             )
             with open(word_bboxes_path, "r", encoding="utf-8") as f:
                 word_bboxes = json.load(f)
             words.append(word_bboxes["words"])
             bboxes.append(word_bboxes["bboxes"])
 
-        encoding = {"start_positions" : [example["answer_start_token_idx"] for example in examples]}
-        encoding["end_positions"] = [example["answer_end_token_idx"] for example in examples]
-
-        encoding.update(self.processor(
+        encoding = self.processor(
             images,
             questions,
             words,
@@ -252,36 +240,42 @@ class SquadDataset(pl.LightningDataModule):
             max_length=self.llmv3_max_length,
             truncation=True,
             padding="max_length",
-        ))
+        )
+
+        encoding["start_positions"] = [
+            example["answer_start"] + len(example["question"]) + 2
+            for example in examples
+        ]
+        encoding["end_positions"] = [
+            example["answer_end"] + len(example["question"]) + 2 for example in examples
+        ]
+        # FIXED LATER: Why +2 is needed? This trick doesn't work always
 
         for key, value in encoding.items():
             if key == "pixel_values":
                 encoding[key] = torch.FloatTensor(
                     np.array(value)
-                )
+                )  # need to use torch.cuda.FloatTensor?
             else:
                 encoding[key] = torch.LongTensor(
                     np.array(value)
-                )
-
-        # Needed for calculating metrics:
-        encoding['answer_text'] = [example["answer_text"].strip() for example in examples]
+                )  # need to use torch.cuda.LongTensor?
 
         return encoding
 
-    def dataloader(self, split_name: str, shuffle: bool) -> DataLoader:
+    def dataloader(self, split_name: str) -> DataLoader:
         """
         Returns data as torch DataLoader object for given split (train/dev/test).
         """
         return DataLoader(
             self.splitted_dataset[split_name],
             batch_size=self.batch_size,
-            shuffle=shuffle,
+            shuffle=False,
             drop_last=False,
-            num_workers=self.num_workers,
+            num_workers=self.num_workers, # no.of cpu cores
             collate_fn=self._prepare_examples[self.model_name],
         )
-
+        # set num_workers>0 and pin_memory=True (only for GPUs).
 
     @staticmethod
     def add_argparse_args(parent_parser) -> configargparse.ArgParser:
@@ -374,28 +368,10 @@ class SquadDataset(pl.LightningDataModule):
             help="Question + context tokens length for RoBERTa.",
         )
         parser.add_argument(
-            "--llmv3_stride",
+            "--seed",
             type=int,
-            default=50,
-            help="Stride of LLMv3.",
-        )
-        parser.add_argument(
-            "--roberta_stride",
-            type=int,
-            default=50,
-            help="Stride of RoBERTa.",
-        )
-        parser.add_argument(
-            "--split_seed",
-            type=int,
-            default=None,
+            default=0,
             help="Seed for randomness in train-dev-test split.",
-        )
-        parser.add_argument(
-            "--dataloader_seed",
-            type=int,
-            default=None,
-            help="Seed for randomness in batch split.",
         )
         parser.add_argument(
             "--num_workers",

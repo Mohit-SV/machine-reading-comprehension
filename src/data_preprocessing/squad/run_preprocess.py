@@ -13,17 +13,12 @@ from preprocess_squad import (
     create_squad_like_json,
     generate_pdfs_images_bboxes,
     generate_para_images,
-    create_preliminary_modelling_data,
-    group_answers_as_lists
+    create_modelling_data,
+    squad_load
 )
 import zipfile
 import logging
 import shutil
-
-SRC_DIRECTORY = os.path.split(os.path.split(os.path.dirname(__file__))[0])[0]
-sys.path.append(SRC_DIRECTORY)
-sys.path.append(os.path.join(SRC_DIRECTORY, "data_processing"))
-from data_processing import offset_start_end_positions
 
 # Init logging
 logger = logging.getLogger(__name__)
@@ -32,13 +27,9 @@ logging.basicConfig(
 )
 
 def create_visual_squad(
-    data: str,
+    train_data_path: str,
+    dev_data_path: str,
     output_dir: str,
-    llmv3_max_length,
-    roberta_max_length,
-    llmv3_stride,
-    roberta_stride,
-    batch_size,
     doc_limit: Union[int, None] = None,
     zip_path: Union[str, None] = None,
     html_version: str = "2017",
@@ -47,7 +38,7 @@ def create_visual_squad(
     size_factor: int = 1,
     max_token_length: int = 512,
     ignore_impossible: bool = True,
-    para_asset_type: str = "para_box",
+    para_asset_type: str = "para_box"
 ):
     """
     Creates Visual SQuAD dataset using path of original SQuAD dataset file
@@ -98,6 +89,11 @@ def create_visual_squad(
     :param para_asset_type: Type of para asset to generate "page_width_fit_para_box", 
         "para_box", or "whole_para_page"
     """
+
+    train_data = squad_load(train_data_path)
+    dev_data = squad_load(dev_data_path)
+
+    data = train_data + dev_data
     if doc_limit:
         data = data[:doc_limit]
 
@@ -117,33 +113,21 @@ def create_visual_squad(
     create_squad_like_json(output_dir)
 
     logger.info("Generating PDFs, page images, their words & bounding boxes....")
+    # Assets: PDF, page images, words, bounding boxes
     generate_pdfs_images_bboxes(output_dir, size_factor=size_factor)
 
     logger.info("Generating para images, their words & bounding boxes....")
+    # Asset: para images
     generate_para_images(output_dir, size_factor=size_factor)
-    
+
     logger.info("Generating jsons that are needed for modelling....")
-    create_preliminary_modelling_data(
+    # Assets: textual and multi-modal model data
+    create_modelling_data(
         output_dir,
         max_token_length=max_token_length,
         ignore_impossible=ignore_impossible,
         para_asset_type=para_asset_type
     )
-
-    dataset_json_path = os.path.join(output_dir, "modelling_data.json")
-    para_texts_path = os.path.join(output_dir, "doc_data.json")
-
-    logger.info("Offsetting RoBERTa and/or LLMv3 start and end positions in the modelling data....")
-    offset_start_end_positions(
-        dataset_json_path, 
-        para_texts_path, 
-        roberta_max_length=roberta_max_length,
-        roberta_stride=roberta_stride,
-        batch_size=batch_size
-        )
-
-    # logger.info("Group answers corresponding to each question as list in the modelling data....") 
-    # group_answers_as_lists(dataset_json_path)
 
     logger.info(f"Completed generating Visual Squad data! The files are ready in {output_dir}")
 
@@ -173,28 +157,3 @@ def zip_output_data(output_dir, out_file):
                 zf.write(original_file, output_file)
 
     zf.close()
-    
-
-# sys.path.append(os.path.join(SRC_DIRECTORY, "constants"))
-# from constants import *
-# from preprocess_squad import squad_load
-# data = squad_load(DEVSET_PATH) # + squad_load(TRAINSET_PATH)
-# create_visual_squad(
-#     data=data,
-#     output_dir= os.path.join(SRC_DIRECTORY, "outputs", "squad", "processed_dev_2017"),
-#     llmv3_max_length=200,
-#     roberta_max_length=200,
-#     llmv3_stride=50,
-#     roberta_stride=50,
-#     batch_size=20,
-#     html_version= "2017",
-#     threshold_min = 1,
-#     threshold_max= 1,
-#     size_factor= 1,
-#     ignore_impossible = True,
-#     para_asset_type = "para_box",
-#     )
-
-# output_dir = "src\\outputs\\29_06_data"
-# out_file = "src\\outputs\\29_06_data.zip"
-# zip_output_data(output_dir, out_file)

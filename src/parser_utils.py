@@ -5,8 +5,8 @@ Loads all the arguments
 import configargparse
 import torch
 from typing import Tuple
-from constants import SRC_DIRECTORY
 import os
+from constants import SRC_DIRECTORY
 
 
 def get_args() -> Tuple[configargparse.Namespace, configargparse.ArgParser, str]:
@@ -26,6 +26,7 @@ def get_args() -> Tuple[configargparse.Namespace, configargparse.ArgParser, str]
         is_config_file=True,
         help="config file path",
     )
+    
     parser.add_argument(
         "--experiment_name",
         help="Experiment name.",
@@ -37,11 +38,11 @@ def get_args() -> Tuple[configargparse.Namespace, configargparse.ArgParser, str]
     parser.add_argument(
         "--no_cuda", action="store_true", default=False, help="Disables CUDA training."
     )
-    parser.add_argument("--early_stopping_patience", type=int, help="patience in early stopping")
+    parser.add_argument("--patience", type=int, help="patience.")
 
     args, unknown = parser.parse_known_args()
     args.cuda = not args.no_cuda and torch.cuda.is_available()
 
-    accelerator = "cuda" if args.cuda else "cpu"
+    device = "cuda" if args.cuda else "cpu"
 
-    return args, parser, accelerator
+    return args, parser, device
