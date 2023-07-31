@@ -10,14 +10,16 @@ from transformers import (
 )
 from transformers.modeling_outputs import QuestionAnsweringModelOutput
 import logging
-import numpy as np
-import string, re
 from constants import *
 from torch import Tensor
 from ranger21 import Ranger21
 from typing import List, Tuple, Dict, Union
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 import configargparse
+from torchmetrics.functional.text.squad import (
+    _compute_f1_score,
+    _compute_exact_match_score,
+)
 
 # Init logging
 logger = logging.getLogger(__name__)
@@ -38,6 +40,7 @@ class QAModel(pl.LightningModule):
         optimizer,
         log_val_every_n_steps,
         log_test_every_n_steps,
+        profiler,
         llmv3_checkpoint=LLMv3_BACKBONE,
         roberta_checkpoint=RoBERTa_BACKBONE,
         normalize: bool = False,
@@ -58,15 +61,16 @@ class QAModel(pl.LightningModule):
         self.normalize = normalize
         self.log_val_every_n_steps = log_val_every_n_steps
         self.log_test_every_n_steps = log_test_every_n_steps
+        self.count_epoch = 0
+        self.profiler = profiler
 
-        self.model_name = model_name
-        if self.model_name == "LLMv3":
+        if model_name == "LLMv3":
             self.tokenizer = LayoutLMv3TokenizerFast.from_pretrained(llmv3_checkpoint)
             self.model = LayoutLMv3ForQuestionAnswering.from_pretrained(
                 llmv3_checkpoint
             )
             self.forward = self.forward_llmv3
-        elif self.model_name == "RoBERTa":
+        elif model_name == "RoBERTa":
             self.tokenizer = RobertaTokenizerFast.from_pretrained(roberta_checkpoint)
             self.model = RobertaForQuestionAnswering.from_pretrained(roberta_checkpoint)
             self.forward = self.forward_roberta
@@ -76,11 +80,11 @@ class QAModel(pl.LightningModule):
                 f"choose one of 'LLMv3' or 'RoBERTa'"
             )
 
-        self.stats_keys = ["loss", "f1_score", "precision", "recall", "em"]
-        # updated cumulatively for each epoch by aggregating (sum) scores from each step
-        self.cumulative_stats = {
-            mode: {key: 0 for key in self.stats_keys} for mode in ["train", "val"]
-        }
+        self.stats_keys = ["loss", "f1_score", "em"]
+
+    ###################################################
+    # Optimizer
+    ###################################################
 
     def configure_optimizers(self):
         if self.optimizer.lower() == "adam":
@@ -111,7 +115,13 @@ class QAModel(pl.LightningModule):
             )
         return optimizer
 
-    def forward_llmv3(self, batch: Dict) -> QuestionAnsweringModelOutput:
+    ###################################################
+    # Forward functions
+    ###################################################
+
+    def forward_llmv3(
+        self, batch: Dict[str, Union[List[Union[str, int, Tensor]], Tensor]]
+    ) -> QuestionAnsweringModelOutput:
         return self.model(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
@@ -121,7 +131,9 @@ class QAModel(pl.LightningModule):
             end_positions=batch["end_positions"],
         )
 
-    def forward_roberta(self, batch: Dict) -> QuestionAnsweringModelOutput:
+    def forward_roberta(
+        self, batch: Dict[str, Union[List[Union[str, int, Tensor]], Tensor]]
+    ) -> QuestionAnsweringModelOutput:
         return self.model(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
@@ -129,15 +141,16 @@ class QAModel(pl.LightningModule):
             end_positions=batch["end_positions"],
         )
 
-    ##################################
+    ###################################################
     # Training
-    ##################################
+    ###################################################
 
     def training_step(
-        self, batch: Dict[str, Union[List[Union[str, Tensor]], Tensor]]
+        self, batch: Dict[str, Union[List[Union[str, int, Tensor]], Tensor]]
     ) -> Dict[str, Tensor]:
         """Runs forward function and logs loss + metrics in training step"""
-        return self.run_for_each_step(batch, "train")
+        outputs = self.forward(batch)
+        return self.get_stats_each_step(batch, outputs, "train")
 
     def training_epoch_end(self, outputs: List[Dict[str, Tensor]]):
         """
@@ -145,38 +158,41 @@ class QAModel(pl.LightningModule):
         """
         # outputs.loss = [{'loss': tensor(6.2211)}, {'loss': tensor(6.1990)}...]
         self.run_for_each_epoch(outputs, "train")
+        self.profiler.step()
 
-    def on_train_end(self):
-        self.run_at_end("train")
-
-    ##################################
+    ###################################################
     # Validation
-    ##################################
+    ###################################################
 
     def validation_step(
-        self, batch: Dict[str, Union[List[Union[str, Tensor]], Tensor]], batch_idx: int
+        self,
+        batch: Dict[str, Union[List[Union[str, int, Tensor]], Tensor]],
+        batch_idx: int,
     ) -> Dict[str, Tensor]:
         """Runs forward function and logs loss + metrics in validation step"""
-        return self.run_for_each_step(batch, "val", batch_idx)
+        outputs = self.forward(batch)
+        return self.get_stats_each_step(batch, outputs, "val", batch_idx)
 
     def validation_epoch_end(self, outputs: List[Dict[str, Tensor]]):
         """
         Computes and logs averages of validation step losses and metrics at end of each epoch
         """
         self.run_for_each_epoch(outputs, "val")
+        self.count_epoch += 1
+        self.profiler.step()
 
-    def on_validation_end(self):
-        self.run_at_end("val")
-
-    ##################################
+    ###################################################
     # Testing
-    ##################################
+    ###################################################
 
     def test_step(
-        self, batch: Dict[str, Union[List[Union[str, Tensor]], Tensor]], batch_idx: int
+        self,
+        batch: Dict[str, Union[List[Union[str, int, Tensor]], Tensor]],
+        batch_idx: int,
     ) -> Dict[str, Tensor]:
         """Runs forward function and logs loss + metrics in testing step"""
-        return self.run_for_each_step(batch, "test", batch_idx)
+        outputs = self.forward(batch)
+        return self.get_stats_each_step(batch, outputs, "test", batch_idx)
 
     def test_epoch_end(self, outputs: List[Dict[str, Tensor]]):
         """
@@ -187,25 +203,28 @@ class QAModel(pl.LightningModule):
             stat: torch.stack([step_out[stat] for step_out in outputs]).mean()
             for stat in self.stats_keys
         }
-        logging.info(f"test stats: {final_stats}")
+        logger.info(f"test stats: {final_stats}")
+        self.profiler.step()
 
-    ##################################
+    ###################################################
     # Shared functions
-    ##################################
+    ###################################################
 
-    def run_for_each_step(
+    def get_stats_each_step(
         self,
-        batch: Dict[str, Union[List[Union[str, Tensor]], Tensor]],
+        batch: Dict[str, Union[List[Union[str, int, Tensor]], Tensor]],
+        outputs: QuestionAnsweringModelOutput,
         mode: str,
         batch_idx: Union[int, None] = None,
     ) -> Dict[str, Tensor]:
         """
         Logs average losses + metrics over all steps in an epoch of train/validation in tensorboard
 
+        :param batch: input batch
         :param mode: "train" or "val"
+        :param batch_idx: batch index
         :return: statistics (loss + metrics) of each step
         """
-        outputs = self.forward(batch)
         target_answers, predicted_answers = self.decode_output(batch, outputs)
 
         if self.normalize:
@@ -243,108 +262,83 @@ class QAModel(pl.LightningModule):
         """
         Logs average losses + metrics over all steps in an epoch of train/validation on tensorboard
 
-        :outputs: list of stat dicts from each step
+        :param outputs: list of stat dicts from each step
         :param mode: "train" or "val"
         """
         epoch_end_stats = {}
 
-        for stat in self.stats_keys:
-            avg_stat = torch.stack(
+        epoch_end_stats = {
+            stat: round(torch.stack(
                 [
                     step_out[stat]
                     for step_out in outputs
                     if not torch.isnan(step_out[stat])
                 ]
-            ).mean()
-            epoch_end_stats[f"{mode}_{stat}_per_epoch"] = avg_stat
-            self.cumulative_stats[mode][stat] = torch.add(
-                avg_stat, self.cumulative_stats[mode][stat]
-            )
-
-        self.log_dict(epoch_end_stats, on_epoch=True, on_step=False)
-
-    def run_at_end(self, mode: str):
-        """
-        Logs average losses + metrics over all epochs of train/validation on console
-
-        :param mode: "train" or "val"
-        """
-        final_stats = {
-            stat: torch.div(self.cumulative_stats[mode][stat], self.max_epochs)
+            ).mean().item(), 4)
             for stat in self.stats_keys
         }
-        logging.info(f"{mode} stats: {final_stats}")
 
-    ##################################
+        logger.info(
+            f"[Epoch {self.count_epoch}] {mode} stats: {epoch_end_stats}" 
+        )
+
+        log_stats = {
+            f"{mode}_{stat}_per_epoch": value for stat, value in epoch_end_stats.items()
+        }
+
+        self.log_dict(log_stats, on_epoch=True, on_step=False)
+
+    ###################################################
     # Metrics
-    ##################################
+    ###################################################
 
     def get_all_scores(
         self, target_answers: List[str], predicted_answers: List[str]
     ) -> Dict[str, Tensor]:
         """
-        Gets metrics: 'f1_score', 'precision', 'recall', 'em'.
+        Gets metrics: 'f1_score', 'em'.
 
         :target_answers: list of gold standard answers
         :predicted_answers: list of answers predicted by the model
         :return: dictionary containing metrics for respective target_answers, predicted_answers
         """
 
-        def get_scores_per_sample(
-            pred_tokens: List[str], truth_tokens: List[str]
-        ) -> List[float]:
-            precision, recall, f1_score = 0, 0, 0
-            if len(pred_tokens) == 0 or len(truth_tokens) == 0:
-                f1_score = int(pred_tokens == truth_tokens)
-            else:
-                n_common_tokens = len(set(pred_tokens) & set(truth_tokens))
-                if n_common_tokens != 0:
-                    precision = n_common_tokens / len(pred_tokens)
-                    recall = n_common_tokens / len(truth_tokens)
-                    f1_score = 2 * (precision * recall) / (precision + recall)
-            return [precision, recall, f1_score]
-
-        scores = np.mean(
-            [
-                get_scores_per_sample(target_answer.split(), predicted_answer.split())
-                for target_answer, predicted_answer in zip(
-                    target_answers, predicted_answers
-                )
-            ],
-            axis=0,
+        batch_em_score = (
+            torch.stack(
+                [
+                    _compute_exact_match_score(target_answer, predicted_answer)
+                    for target_answer, predicted_answer in zip(
+                        target_answers, predicted_answers
+                    )
+                ]
+            )
+            .float()
+            .mean()
         )
 
-        return {
-            "precision": torch.tensor(scores[0]),
-            "recall": torch.tensor(scores[1]),
-            "f1_score": torch.tensor(scores[2]),
-            "em": torch.tensor(self.get_em_score(target_answers, predicted_answers)),
-        }
-
-    @staticmethod
-    def get_em_score(target_answers: List[str], predicted_answers: List[str]) -> float:
-        """
-        Outputs exact-match (em) scores.
-
-        :target_answers: list of gold standard answers
-        :predicted_answers: list of answers predicted by the model
-        :return: list of exact match scores for respective target_answers, predicted_answers
-        """
-        return np.mean(
-            [
-                int(target_answer == predicted_answer)
-                for target_answer, predicted_answer in zip(
-                    target_answers, predicted_answers
-                )
-            ]
+        batch_f1_score = (
+            torch.stack(
+                [
+                    _compute_f1_score(target_answer, predicted_answer)
+                    for target_answer, predicted_answer in zip(
+                        target_answers, predicted_answers
+                    )
+                ]
+            )
+            .float()
+            .mean()
         )
 
-    ##################################
+        return {"f1_score": batch_f1_score, "em": batch_em_score}
+
+    ###################################################
     # Post-processing
-    ##################################
+    ###################################################
 
     def decode_output(
-        self, batch: Dict[str, Tensor], outputs: QuestionAnsweringModelOutput
+        self,
+        batch: Dict[str, Union[List[Union[str, int, Tensor]], Tensor]],
+        outputs: Dict[str, Tensor],
     ) -> Tuple[List[str]]:
         """
         Decodes model outputs into predicted answers.
@@ -357,8 +351,12 @@ class QAModel(pl.LightningModule):
         """
         # output start_logits and end_logits indicate which token the model thinks
         # is at the start of the answer, and which token is at the end of the answer
-        pred_answer_start_indices = outputs.start_logits.argmax(-1)
-        pred_answer_end_indices = outputs.end_logits.argmax(-1)
+        start_logits = outputs.start_logits
+        end_logits = outputs.end_logits
+
+        start_pos_confidences, pred_answer_start_indices = start_logits.max(dim=-1)
+        end_pos_confidences, pred_answer_end_indices = end_logits.max(dim=-1)
+        answer_confidences = (start_pos_confidences + end_pos_confidences) / 2
 
         pred_batch_answer_tokens = [
             input_ids.squeeze(-1)[answer_start_index : answer_end_index + 1]
@@ -368,42 +366,71 @@ class QAModel(pl.LightningModule):
         ]
         # +1 : to include last character
 
-        predicted_answers = [
-            self.tokenizer.decode(
-                answer_tokens,
-                skip_special_tokens=True,
-                # clean_up_tokenization_spaces=False # https://discuss.huggingface.co/t/layoutlmv3-q-a-inference/29872/3
-            )
+        # answers from each span of each sample
+        predicted_span_answers = [
+            (
+                self.tokenizer.decode(
+                    answer_tokens,
+                    skip_special_tokens=True,
+                    # clean_up_tokenization_spaces=False # https://discuss.huggingface.co/t/layoutlmv3-q-a-inference/29872/3
+                )
+            ).replace("\n", "")
             for answer_tokens in pred_batch_answer_tokens
         ]
 
+        # answers for each question/sample
+        predicted_answers = self.get_predicted_answers(
+            predicted_span_answers,
+            answer_confidences,
+            batch["overflow_to_sample_mapping"],
+        )
         target_answers = batch["answer_text"]
 
         return target_answers, predicted_answers
 
     @staticmethod
-    def normalize_text(text: str) -> str:
-        """1. Lowercases text 2. Removes articles, punctuations 3. Fixes white spaces"""
+    def get_predicted_answers(
+        predicted_span_answers: List[str],
+        answer_confidences: Tensor,
+        sample_mapping: List[int],
+    ):
+        """
+        Returns predicted answers of each sample from given predicted answers of
+        each span of every sample
 
-        def remove_articles(text):
-            regex = re.compile(r"\b(a|an|the)\b", re.UNICODE)
-            return re.sub(regex, " ", text)
+        :param predicted_span_answers: list of answers predicted in each span of
+            every sample
+        :param answer_confidences: list of likelihoods of answers from respective
+            spans being correct
+        :param sample_mapping: span index to sample index mapping
+        :return: list of predicted answers corresponding to given predicted_span_answers
+        """
+        predicted_answers = {}
 
-        def white_space_fix(text):
-            return " ".join(text.split())
+        prev_span_index = 0
+        for span_index, answer in enumerate(predicted_span_answers):
+            sample_index = sample_mapping[span_index]
+            if sample_index in predicted_answers:
+                if len(predicted_answers[sample_index]) != 0:
+                    if (
+                        len(answer) != 0
+                        and answer_confidences[span_index]
+                        > answer_confidences[prev_span_index]
+                    ):
+                        predicted_answers[sample_index] = answer
+                        prev_span_index = span_index
+                else:
+                    predicted_answers[sample_index] = answer
+                    prev_span_index = span_index
+            else:
+                predicted_answers[sample_index] = answer
+                prev_span_index = span_index
 
-        def remove_punc(text):
-            exclude = set(string.punctuation)
-            return "".join(ch for ch in text if ch not in exclude)
+        return list(predicted_answers.values())
 
-        def lower(text):
-            return text.lower()
-
-        return white_space_fix(remove_articles(remove_punc(lower(text))))
-
-    ##################################
+    ###################################################
     # Arguments
-    ##################################
+    ###################################################
 
     @staticmethod
     def add_argparse_args(

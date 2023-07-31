@@ -1,18 +1,24 @@
-# external tools that can be reused in preprocessing of any dataset
+"""
+External tools that can be reused in visualize results preprocessed data
+"""
+
 from PIL import Image, ImageDraw
 import os
 from typing import List
+import json
 
 
-def show_bboxes(bboxes: List, image_dir: str, pg_nr: str):
+def show_bboxes(page_dir: str):
     """
-    Displays image of a page with word boxes.
+    Displays image with word boxes.
 
-    :param word_bboxes: list of bounding boxes
-    :param image_dir: path of directory in which document images are saved
-    :param pg_nr: page number of document
+    :param page_dir: path of directory in which page image, bboxes are saved
     """
-    image_path = os.path.join(image_dir, f"{pg_nr}.png")
+    image_path = os.path.join(page_dir, "image.png")
+    word_bboxes_path = os.path.join(page_dir, "bboxes.json")
+    with open(word_bboxes_path, "r", encoding="utf-8") as f:
+        word_bboxes = json.load(f)
+    bboxes = word_bboxes["bboxes"]
     image = Image.open(image_path)
     draw = ImageDraw.Draw(image)
 

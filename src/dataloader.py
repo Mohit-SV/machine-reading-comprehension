@@ -21,7 +21,7 @@ import pytorch_lightning as pl
 from typing import Union
 from data_preprocessing.squad.preprocess_squad import squad_load
 from data_preprocessing.squad.run_preprocess import create_visual_squad
-from typing import Dict, Union, List
+from typing import Dict, Union, List, Tuple
 import configargparse
 
 
@@ -32,24 +32,32 @@ class SquadDataset(pl.LightningDataModule):
         batch_size: int,
         dev_ratio: float,
         test_ratio: float,
-        seed: int,
+        split_seed: int,
         tokenizer_max_length: int,
         tokenizer_stride: int,
         num_workers: int,
+        is_layout_dependent: bool,
+        include_references: bool,
+        image_width: Union[int, None],
+        image_height: Union[int, None],
         dataset_dir: str = V_SQUAD_DIR,
         llmv3_checkpoint: str = LLMv3_BACKBONE,
         roberta_checkpoint: str = RoBERTa_BACKBONE,
     ):
         """
         :param model_name: LLMv3 or RoBERTa
-        :param batch_size: number of samples per each batch
+        :param batch_size: size of batches outputted by dataloader
         :param dev_ratio: Validation set to total dataset size ratio
         :param test_ratio: Test set to total dataset size ratio
-        :param seed: seed from randomness in splitting the dataset
+        :param split_seed: seed of randomness in splitting the dataset
         :param tokenizer_max_length: max_length used for tokenizing each question-
             answer while offsetting answer positions
         :param tokenizer_stride: stride for while tokenizing each question-answer
             while offsetting answer positions
+        :param num_workers: number of workers in dataloader to parallel process
+        :param is_layout_dependent: whether RoBERTa should know the layout by \n's
+        :param include_references: to include citation numbers from webpages or not
+        :param image_size: size to which images are to be resized
         :param dataset_dir: directory in which dataset files live
         :param llmv3_checkpoint: LLMv3 checkpoint for tokenizing and processing
         :param roberta_checkpoint: RoBERTa checkpoint for tokenizing
@@ -63,44 +71,50 @@ class SquadDataset(pl.LightningDataModule):
         self.tokenizer_max_length = tokenizer_max_length
         self.tokenizer_stride = tokenizer_stride
         self.num_workers = num_workers
+        self.is_layout_dependent = is_layout_dependent
 
         self.dataset_dir = dataset_dir
-        self.para_texts_path = os.path.join(self.dataset_dir, "doc_data.json")
         self.dataset_json_path = os.path.join(self.dataset_dir, "modelling_data.json")
 
-        if not os.path.exists(self.para_texts_path) or not os.path.exists(
-            self.dataset_json_path
-        ):
-            self.create_dataset(doc_limit=5, zip_path=None)
+        if not os.path.exists(self.dataset_json_path):
+            self.create_dataset(
+                doc_limit=2,
+                include_references=include_references,
+                zip_path=None,
+                image_width=image_width,
+                image_height=image_height
+            )
 
-        self.para_texts_df = self.load_para_texts()
         self.dataset = self.load_dataset()
-
-        self.seed = seed
+        self.split_seed = split_seed
         self.splitted_dataset = self.split_data()
 
-        self.model_name = model_name
-        assert self.model_name in ["LLMv3", "RoBERTa"]
+        if model_name == "LLMv3":
+            self.llmv3_tokenizer = LayoutLMv3TokenizerFast.from_pretrained(
+                llmv3_checkpoint
+            )
+            self.image_feature_extractor = LayoutLMv3ImageProcessor(
+                apply_ocr=False, ocr_lang="eng", size=None, do_resize=True
+            )
+            self.tokenizer = LayoutLMv3Processor(
+                self.image_feature_extractor, self.llmv3_tokenizer
+            )
+            self._prepare_examples = self.prepare_LLMv3_examples
+        elif model_name == "RoBERTa":
+            self.tokenizer = RobertaTokenizerFast.from_pretrained(roberta_checkpoint)
+            self._prepare_examples = self.prepare_RoBERTa_examples
+        else:
+            raise ValueError(
+                f"Unexpected type of model specified ({self.model_name}), "
+                f"choose one of 'LLMv3' or 'RoBERTa'"
+            )
 
-        self.llmv3_tokenizer = LayoutLMv3TokenizerFast.from_pretrained(llmv3_checkpoint)
-        self.roberta_tokenizer = RobertaTokenizerFast.from_pretrained(
-            roberta_checkpoint
-        )
+    ###################################################
+    # Dataset creation
+    ###################################################
 
-        self.image_feature_extractor = LayoutLMv3ImageProcessor(
-            apply_ocr=False, ocr_lang="eng"
-        )
-        self.processor = LayoutLMv3Processor(
-            self.image_feature_extractor, self.llmv3_tokenizer
-        )
-
-        self._prepare_examples = {
-            "LLMv3": self.prepare_LLMv3_examples,
-            "RoBERTa": self.prepare_RoBERTa_examples,
-        }
-
+    @staticmethod
     def create_dataset(
-        self,
         data_paths: List[str] = [TRAINSET_PATH, DEVSET_PATH],
         output_dir: str = V_SQUAD_DIR,
         doc_limit: Union[int, None] = DOC_LIMIT,
@@ -108,47 +122,40 @@ class SquadDataset(pl.LightningDataModule):
         html_version: str = "2017",
         threshold_min: int = 1,
         threshold_max: int = 1,
-        size_factor: int = 1,
-        max_token_length: int = 512,
-        ignore_impossible: bool = True,
-        para_asset_type: str = "para_box",
+        image_width: Union[int, None] = None,
+        image_height: Union[int, None] = None,
+        include_references: bool = False,
     ):
         """
         Calls create_visual_squad from src\data_preprocessing\squad\run_preprocess.py to create
         visual squad dataset.
         """
-        data = []
+        data = list()
         for data_path in data_paths:
             data.extend(squad_load(data_path))
 
         create_visual_squad(
             data=data,
             output_dir=output_dir,
-            tokenizer_max_length=self.tokenizer_max_length,
-            tokenizer_stride=self.tokenizer_stride,
-            batch_size=self.batch_size,
             doc_limit=doc_limit,
             zip_path=zip_path,
             html_version=html_version,
             threshold_min=threshold_min,
             threshold_max=threshold_max,
-            size_factor=size_factor,
-            max_token_length_limit=max_token_length,
-            ignore_impossible=ignore_impossible,
-            para_asset_type=para_asset_type,
+            image_width=image_width,
+            image_height=image_height,
+            include_references=include_references,
         )
+
+    ###################################################
+    # Loading dataset
+    ###################################################
 
     def load_dataset(self) -> Dataset:
         """
         Loads dataset from input dataset json file.
         """
         return Dataset.from_json(self.dataset_json_path)
-
-    def load_para_texts(self) -> pd.DataFrame:
-        """
-        Returns pandas dataframe containing doc_ids and list paras in each document.
-        """
-        return pd.read_json(self.para_texts_path, orient="records")
 
     def __getitem__(self, index: int) -> Dict:
         """
@@ -166,56 +173,100 @@ class SquadDataset(pl.LightningDataModule):
         """
         Splits input dataset and returns dictionary of Dataset objects for train, dev, test.
         """
-        rest_and_test = self.dataset.train_test_split(
-            test_size=self.test_ratio, seed=self.seed
-        )
-        train_dev = rest_and_test["train"].train_test_split(
-            test_size=self.dev_ratio / (1 - self.test_ratio), seed=self.seed
-        )
+        # No shuffle
+        if self.split_seed is None:
+            rest_and_test = self.dataset.train_test_split(
+                test_size=self.test_ratio, shuffle=False
+            )
+            train_dev = rest_and_test["train"].train_test_split(
+                test_size=self.dev_ratio / (1 - self.test_ratio), shuffle=False
+            )
+        # With shuffling
+        else:
+            rest_and_test = self.dataset.train_test_split(
+                test_size=self.test_ratio, seed=self.split_seed
+            )
+            train_dev = rest_and_test["train"].train_test_split(
+                test_size=self.dev_ratio / (1 - self.test_ratio), seed=self.split_seed
+            )
         return {
             "train": train_dev["train"],
             "dev": train_dev["test"],
             "test": rest_and_test["test"],
         }
 
+    ###################################################
+    # Dataloader
+    ###################################################
+
+    def to_dataloader(self, split_name: str, shuffle: bool = False) -> DataLoader:
+        """
+        Returns data as torch DataLoader object for given split (train/dev/test).
+        """
+        return DataLoader(
+            self.splitted_dataset[split_name],
+            batch_size=self.batch_size,
+            shuffle=shuffle,
+            drop_last=False,
+            num_workers=self.num_workers,
+            collate_fn=self._prepare_examples,
+        )
+
+    ###################################################
+    # Collate functions
+    ###################################################
+
     def prepare_RoBERTa_examples(
         self, examples: List[Dict[str, Union[str, int]]]
-    ) -> Dict[str, Union[str, torch.Tensor]]:
+    ) -> Dict[str, Union[str, torch.Tensor, List[int]]]:
         """
         Encodes the batch data (context + questions).
 
-        :return: dictionary containing encoded input_ids, attention_mask, start_positions and
-            end_positions.
+        :param examples: batch of samples from dataloader input
+        :return: dictionary containing encoded input_ids, attention_mask,
+            overflow_to_sample_mapping, start_positions and end_positions.
         """
-        contexts = [
-            self.para_texts_df[self.para_texts_df["doc_id"] == example["doc_id"]][
-                "paras"
-            ].values[0][example["idx_para_matched"]]
-            for example in examples
-        ]
+        contexts_with_linebreaks, questions = list(), list()
 
-        questions = [example["question"].strip() for example in examples]
+        for example in examples:
+            questions.append(example["question"].strip())
 
-        encoding = {
-            "start_positions": [
-                example["answer_start_token_idx"] for example in examples
-            ]
-        }
-        encoding["end_positions"] = [
-            example["answer_end_token_idx"] for example in examples
-        ]
-
-        encoding.update(
-            self.roberta_tokenizer(
-                questions,
-                contexts,
-                max_length=self.tokenizer_max_length,
-                truncation="only_second",
-                return_overflowing_tokens=False,
-                return_offsets_mapping=False,
-                padding="max_length",
+            text_file_path = os.path.join(
+                SRC_DIRECTORY, example["image_path"].replace("image.png", "text.txt")
             )
+            with open(text_file_path, "r", encoding="utf-8") as file:
+                contexts_with_linebreaks.append(file.read().replace("\n", "\n "))
+
+        if self.is_layout_dependent:
+            for i, example in enumerate(examples):
+                example["answer_start_char_idx"] = self.map_indices(
+                    contexts_with_linebreaks[i], example["answer_start_char_idx"]
+                )
+                example["answer_end_char_idx"] = self.map_indices(
+                    contexts_with_linebreaks[i], example["answer_end_char_idx"]
+                )
+            contexts = contexts_with_linebreaks
+        else:
+            contexts = [
+                context.replace("\n", "") for context in contexts_with_linebreaks
+            ]
+
+        tokenized_input = self.tokenizer(
+            questions,
+            contexts,
+            max_length=self.tokenizer_max_length,
+            truncation="only_second",
+            return_overflowing_tokens=True,
+            return_offsets_mapping=True,
+            padding="max_length",
         )
+
+        encoding = {}
+        (
+            encoding["start_positions"],
+            encoding["end_positions"],
+        ) = self._to_token_positions(tokenized_input, examples)
+        encoding.update(tokenized_input)
 
         encoding = {key: torch.LongTensor(value) for key, value in encoding.items()}
 
@@ -224,53 +275,64 @@ class SquadDataset(pl.LightningDataModule):
             [example["answer_text"].strip() for example in examples]
         )
 
+        encoding["overflow_to_sample_mapping"] = tokenized_input[
+            "overflow_to_sample_mapping"
+        ]
+
         return encoding
 
     def prepare_LLMv3_examples(
         self, examples: List[Dict[str, Union[str, int]]]
-    ) -> Dict[str, Union[str, torch.Tensor]]:
+    ) -> Dict[str, Union[str, torch.Tensor, List[int]]]:
         """
         Encodes the combined data from batch information and image data got from paths in batch.
 
+        :param examples: batch of samples from dataloader input
         :return: dictionary containing encoded input_ids, attention_mask, bounding box data,
-            encoded pixel values, start_positions and end_positions.
+            encoded pixel values, overflow_to_sample_mapping, start_positions and end_positions.
         """
-        images = [
-            Image.open(os.path.join(SRC_DIRECTORY, example["image_path"]))
-            for example in examples
-        ]
-        questions = [example["question"].strip() for example in examples]
 
-        words, bboxes = list(), list()
+        words, bboxes, images, questions = list(), list(), list(), list()
+
         for example in examples:
+            images.append(
+                Image.open(os.path.join(SRC_DIRECTORY, example["image_path"]))
+            )
+            questions.append(example["question"].strip())
+
             word_bboxes_path = os.path.join(
-                SRC_DIRECTORY, example["image_path"].replace(".png", ".json")
+                SRC_DIRECTORY, example["image_path"].replace("image.png", "bboxes.json")
             )
             with open(word_bboxes_path, "r", encoding="utf-8") as f:
                 word_bboxes = json.load(f)
             words.append(word_bboxes["words"])
             bboxes.append(word_bboxes["bboxes"])
 
-        encoding = {
-            "start_positions": [
-                example["answer_start_token_idx"] for example in examples
-            ]
-        }
-        encoding["end_positions"] = [
-            example["answer_end_token_idx"] for example in examples
+        tokenized_input = self.tokenizer(
+            images,
+            questions,
+            words,
+            boxes=bboxes,
+            max_length=self.tokenizer_max_length,
+            truncation="only_second",
+            return_overflowing_tokens=True,
+            return_offsets_mapping=True,
+            padding="max_length",
+        )
+
+        tokenized_input["offset_mapping"] = [
+            self.corrected_llmv3_offsets(
+                offsets, tokenized_input.word_ids(i), self.tokenizer_max_length
+            )
+            for i, offsets in enumerate(tokenized_input["offset_mapping"])
         ]
 
-        encoding.update(
-            self.processor(
-                images,
-                questions,
-                words,
-                boxes=bboxes,
-                max_length=self.tokenizer_max_length,
-                truncation=True,
-                padding="max_length",
-            )
-        )
+        encoding = {}
+        (
+            encoding["start_positions"],
+            encoding["end_positions"],
+        ) = self._to_token_positions(tokenized_input, examples)
+        encoding.update(tokenized_input)
 
         for key, value in encoding.items():
             if key == "pixel_values":
@@ -283,20 +345,153 @@ class SquadDataset(pl.LightningDataModule):
             example["answer_text"].strip() for example in examples
         ]
 
+        encoding["overflow_to_sample_mapping"] = tokenized_input[
+            "overflow_to_sample_mapping"
+        ]
+
         return encoding
 
-    def to_dataloader(self, split_name: str, shuffle: bool = False) -> DataLoader:
+    # Helper functions...
+
+    @staticmethod
+    def corrected_llmv3_offsets(
+        offsets: List[Tuple[int]], word_ids: List[int], max_length: int
+    ):
         """
-        Returns data as torch DataLoader object for given split (train/dev/test).
+        LLMv3 offsets look weird. Function converts to similar structure as that
+        of RoBERTa offsets.
+        e.g., offsets of a span:
+            LLMv3: [(0, 0), (0, 4), (5, 8), (9, 14), (14, 16), (17, 22), (23, 30),
+            (30, 32), (33, 38), (39, 42), (43, 49), (50, 51), (52, 56), (57, 63),
+            (63, 64), (0, 0), (0, 0), (0, 5), (5, 7), (8, 13), (13, 15), (16, 26),
+            (27, 29), (30, 36), (37, 43), (44, 47), (48, 57), (58, 63), (64, 68),
+            (68, 69), (70, 74), (75, 79), (80, 85), (85, 87), (88, 89), (89, 91),
+            (91, 95), (96, 100), (100, 103), (104, 113)]
+            RoBERTa: [(0, 0), (0, 4), (5, 8), (9, 12), (13, 17), (18, 20),
+            (21, 26), (26, 28), (28, 30), (31, 36), (37, 41), (42, 47), (47, 48),
+            (0, 0), (0, 0), (0, 3), (3, 5), (5, 7), (7, 8), (9, 14), (14, 16),
+            (17, 27), (28, 30), (31, 37), (38, 44), (45, 48), (48, 49), (50, 59),
+            (60, 65), (66, 70), (70, 71), (72, 76), (76, 77), (78, 82), (82, 83),
+            (84, 89), (89, 91), (92, 93), (93, 95), (95, 99)]
+
+        :param offsets: LLMv3 offsets
+        :param word_ids: A list indicating the word corresponding to each token.
+            Special tokens added by the tokenizer are mapped to None and other tokens
+            are mapped to the index of their corresponding word (several tokens will
+            be mapped to the same word index if they are parts of that word).
+        :param max_length: max sequence length of each span
+        :return: corrected offsets
         """
-        return DataLoader(
-            self.splitted_dataset[split_name],
-            batch_size=self.batch_size,
-            shuffle=shuffle,
-            drop_last=False,
-            num_workers=self.num_workers,
-            collate_fn=self._prepare_examples[self.model_name],
-        )
+        # for each token in input sequence
+        for i in range(max_length):
+            # if not padding token
+            if offsets[i][1] != 0:
+                # if
+                if offsets[i - 1][1] != 0 and word_ids[i] != word_ids[i - 1]:
+                    offsets[i] = (
+                        offsets[i - 1][1] + 1,
+                        offsets[i - 1][1] + (offsets[i][1] - offsets[i][0]) + 1,
+                    )
+                else:
+                    offsets[i] = (
+                        offsets[i - 1][1],
+                        offsets[i - 1][1] + (offsets[i][1] - offsets[i][0]),
+                    )
+        return offsets
+
+    @staticmethod
+    def _to_token_positions(
+        tokenized_examples: Dict[str, torch.Tensor],
+        input_examples: List[Dict[str, Union[str, int]]],
+    ) -> Tuple[List[int]]:
+        """
+        Returns answer start and end token indices in model input sequence using
+        start and end character indices in page
+
+        :param tokenized_examples: huggingface tokenizer output of a batch
+        :param input_examples: batch of a=samples as list of dictionaries,
+            each dictionary contains answer_start_char_idx, answer_end_char_idx
+        :returns:
+            - list of answer start token indices in given batch
+            - list of answer end token indices in given batch
+        """
+        sample_mapping = tokenized_examples["overflow_to_sample_mapping"]
+        offset_mapping = tokenized_examples["offset_mapping"]
+        cls_index = 0
+        n_spans = len(sample_mapping)
+        start_positions = [cls_index] * n_spans
+        end_positions = [cls_index] * n_spans
+
+        for i, offsets in enumerate(offset_mapping):
+
+            input_ids = tokenized_examples["input_ids"][i]
+            sequence_ids = tokenized_examples.sequence_ids(i)
+            sample_index = sample_mapping[i]
+
+            # If no answers are given, set the cls_index as answer. Else...
+            if len(input_examples) != 0:
+                # Start/end character index of the answer in the text.
+                start_char = input_examples[sample_index]["answer_start_char_idx"]
+                end_char = input_examples[sample_index]["answer_end_char_idx"]
+
+                # Start token index of the current span in the text.
+                context_start_index = 0
+                while sequence_ids[context_start_index] != 1:
+                    context_start_index += 1
+
+                # End token index of the current span in the text.
+                context_end_index = len(input_ids) - 1
+                while sequence_ids[context_end_index] != 1:
+                    context_end_index -= 1
+
+                # If the answer is not fully inside the context, label is (0, 0). Else...
+                if (
+                    offsets[context_start_index][0] <= start_char
+                    and offsets[context_end_index][1] >= end_char
+                ):
+                    idx = context_start_index
+                    while idx <= context_end_index and offsets[idx][0] <= start_char:
+                        idx += 1
+                    start_positions[i] = idx - 1
+
+                    idx = context_end_index
+                    while idx >= context_start_index and offsets[idx][1] >= end_char:
+                        idx -= 1
+                    end_positions[i] = idx + 1
+
+        return start_positions, end_positions
+
+    @staticmethod
+    def map_indices(string2, string1_target_index):
+        """
+        Returns index found in page text with linebreakes corresponding to index 
+        of page text without linebreakes
+        e.g.,
+        string1 = "01  45 7   X"
+        string2 = "01 \n 45\n 7\n \n  X"
+        each character in string1 should match with that of string2
+
+        :param string2: string with line brakes
+        :param string1_target_index: An index from string 1 which is without line brakes
+        :return: 
+        """
+        # string1, string2 are text obtained from pdf over which "\n" are
+        # replaced by " " and "\n " respectively. Example text obtained from pdf:
+        # "Headline\nsome text\nSection\nsome more text..."
+
+        # Find the corresponding index in string2
+        string1_index = -1
+        for string2_index in range(len(string2)):
+            if string2[string2_index] != "\n":
+                string1_index += 1
+            if string1_index == string1_target_index:
+                break
+
+        return string2_index
+
+    ###################################################
+    # Arguments
+    ###################################################
 
     @staticmethod
     def add_argparse_args(
@@ -308,21 +503,15 @@ class SquadDataset(pl.LightningDataModule):
         parser = parent_parser.add_argument_group("SquadDataset")
         parser.add_argument(
             "--include_references",
-            type=bool,
+            action="store_true",
             default=False,
-            help="To include citation numbers in text or not.",
+            help="To include citation numbers from webpages or not.",
         )
         parser.add_argument(
             "--html_version",
             type=str,
             default="2017",
             help="Version of wiki articles to scrape: 2017 or online.",
-        )
-        parser.add_argument(
-            "--scale_factor",
-            type=int,
-            default=1,
-            help="Zoom level for saving images from webpage PDFs.",
         )
         parser.add_argument(
             "--threshold_min",
@@ -337,33 +526,15 @@ class SquadDataset(pl.LightningDataModule):
             help="Match percentage (0 to 1) below which QA pair is said to be valid.",
         )
         parser.add_argument(
-            "--max_token_length",
-            type=int,
-            default=512,
-            help="Limit on context + question length.",
-        )
-        parser.add_argument(
-            "--ignore_impossible",
-            type=bool,
-            default=True,
-            help="To ignore impossible QA pairs while creating modelling data.",
-        )
-        parser.add_argument(
-            "--para_asset_type",
-            type=str,
-            default="para_box",
-            help="Type of para asset to generate: page_width_fit_para_box, para_box, or whole_para_page.",
-        )
-        parser.add_argument(
-            "--dev_split",
+            "--dev_ratio",
             type=float,
             default=0.1,
             help="Dev set to whole dataset ratio.",
         )
         parser.add_argument(
-            "--train_split",
+            "--test_ratio",
             type=float,
-            default=0.2,
+            default=0.1,
             help="Test set to whole dataset ratio.",
         )
         parser.add_argument(
@@ -373,10 +544,16 @@ class SquadDataset(pl.LightningDataModule):
             help="Train/validation/test batch size.",
         )
         parser.add_argument(
-            "--image_size_llmv3",
+            "--image_width",
             type=int,
-            default=224,
-            help="Image size to which LayoutLMv3ImageProcessor should resize.",
+            default=None,
+            help="Image width with which we want to save.",
+        )
+        parser.add_argument(
+            "--image_height",
+            type=int,
+            default=None,
+            help="Image height with which we want to save.",
         )
         parser.add_argument(
             "--tokenizer_max_length",
@@ -394,18 +571,24 @@ class SquadDataset(pl.LightningDataModule):
             "--split_seed",
             type=int,
             default=None,
-            help="Seed for randomness in train-dev-test split.",
+            help="Seed for randomness in train-dev-test split. If None, it won't be shuffled",
         )
         parser.add_argument(
             "--dataloader_seed",
             type=int,
             default=None,
-            help="Seed for randomness in batch split.",
+            help="Shuffles train set with this seed. If None, it won't be shuffled",
         )
         parser.add_argument(
             "--num_workers",
             type=int,
             default=0,
             help="Number of workers in dataloader.",
+        )
+        parser.add_argument(
+            "--is_layout_dependent",
+            action="store_true",
+            default=True,
+            help="Should RoBERTa know the layout by \\n's.",
         )
         return parent_parser

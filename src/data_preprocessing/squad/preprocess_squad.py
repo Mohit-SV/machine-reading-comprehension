@@ -10,23 +10,14 @@ from bs4 import BeautifulSoup
 import nltk
 from nltk.tokenize import RegexpTokenizer
 from subprocess import run
-from typing import List, Dict, Union
-import fitz
+from typing import List, Dict, Optional
 import os
 from tqdm import tqdm
 import time
 import pandas as pd
 import sys
-from PIL import Image
-import shutil
-from nltk.corpus import stopwords
 from datetime import datetime
 import logging
-
-try:
-    nltk.data.find('corpora/stopwords')
-except:
-    nltk.download('stopwords')
 
 # Init logging
 logger = logging.getLogger(__name__)
@@ -34,6 +25,14 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s: %(message)s"
 )
 
+try:
+    nltk.data.find("corpora/stopwords")
+except LookupError:
+    logger.info("NLTK stopwords not found. Downloading the package...")
+    nltk.download("stopwords")
+    logger.info("NLTK stopwords downloaded.")
+
+from nltk.corpus import stopwords
 
 ###################################################
 # Constants
@@ -109,6 +108,7 @@ def collect_docs(
     threshold_max: float = 1.0,
     html_version: str = "2017",
     sleep_time: int = 5,
+    include_references: bool = False,
 ):
     """
     Validates the relevancy of wikipages whose titles are found in data
@@ -124,7 +124,9 @@ def collect_docs(
         question-answer pair is said to be valid
     :param html_version: "online" or "2017"
     :param sleep_time: sleep time between scarping each webpage
+    :param include_references: whether to include citation tags like '[5]'
     """
+    
     logs_dir = os.path.join(output_dir, "unsuccessful_logs")
     html_dir = os.path.join(output_dir, "htmls")
 
@@ -142,12 +144,12 @@ def collect_docs(
     )
 
     # file to save scraped data - paras, title
-    doc_data_path = os.path.join(output_dir, "doc_data.json")
+    doc_paras_path = os.path.join(output_dir, "doc_paras.json")
     # file to save qas
     qas_path = os.path.join(output_dir, "qas.json")
 
     remove_old_files(
-        [doc_data_path, qas_path, unsuccessful_qas_path, unsuccessful_doc_path]
+        [doc_paras_path, qas_path, unsuccessful_qas_path, unsuccessful_doc_path]
     )
 
     count_answerable_answers = 0
@@ -160,10 +162,14 @@ def collect_docs(
             if html_version == "online":
                 time.sleep(sleep_time)
                 html = filter_sections_online_html(
-                    get_online_html(get_wikipedia_url(doc["title"]))
+                    get_online_html(
+                        get_wikipedia_url(doc["title"]), include_ref=include_references
+                    )
                 )
             else:
-                html = filter_sections_2017_html(get_html_by_year(doc["title"]))
+                html = filter_sections_2017_html(
+                    get_html_by_year(doc["title"]), include_ref=include_references
+                )
 
             # save HTML
             create_html_file(html, html_path)
@@ -175,7 +181,7 @@ def collect_docs(
                 for para in soup.select("body")[0].find_all("p")
             ]
 
-            with open(doc_data_path, "a", encoding="utf-8") as f:
+            with open(doc_paras_path, "a", encoding="utf-8") as f:
                 json.dump(
                     {"title": doc["title"], "paras": html_paras, "doc_id": doc_id}, f
                 )
@@ -283,7 +289,7 @@ def collect_docs(
 
     # close opened files
     refactor_json_files(
-        [doc_data_path, qas_path, unsuccessful_qas_path, unsuccessful_doc_path]
+        [doc_paras_path, qas_path, unsuccessful_qas_path, unsuccessful_doc_path]
     )
 
     logger.info(
@@ -366,6 +372,8 @@ def filter_sections_online_html(
     For online HTML: filters sections that come after wiki the main article paragraphs.
 
     :param html: online wiki html
+    :param remove_images: if images are to be excluded
+    :param include_ref: whether to include citation tags like '[5]'
     :return: filtered html which doesn't contain unwanted content
     """
     soup = BeautifulSoup(html, "lxml")
@@ -420,6 +428,8 @@ def filter_sections_2017_html(
     For 2017 HTML: filters sections that come after wiki the main article paragraphs.
 
     :param html: online wiki html
+    :param remove_images: if images are to be excluded
+    :param include_ref: whether to include citation tags like '[5]'
     :return: filtered html which doesn't contain unwanted content
     """
     soup = BeautifulSoup(html, "lxml")
@@ -667,9 +677,9 @@ def create_squad_like_json(output_dir: str):
     """
 
     # read files
-    doc_data_path = os.path.join(output_dir, "doc_data.json")
-    with open(doc_data_path, "r", encoding="utf-8") as f:
-        df_doc_data = pd.DataFrame.from_dict(json.load(f))
+    doc_paras_path = os.path.join(output_dir, "doc_paras.json")
+    with open(doc_paras_path, "r", encoding="utf-8") as f:
+        df_doc_paras = pd.DataFrame.from_dict(json.load(f))
     qas_path = os.path.join(output_dir, "qas.json")
     with open(qas_path, "r", encoding="utf-8") as f:
         df_qas = pd.DataFrame.from_dict(json.load(f))
@@ -681,8 +691,8 @@ def create_squad_like_json(output_dir: str):
     data = []
 
     for doc_id, doc_id_group in doc_id_grouped:
-        paras = df_doc_data[df_doc_data["doc_id"] == doc_id]["paras"].iloc[0]
-        title = df_doc_data[df_doc_data["doc_id"] == doc_id]["title"].iloc[0]
+        paras = df_doc_paras[df_doc_paras["doc_id"] == doc_id]["paras"].iloc[0]
+        title = df_doc_paras[df_doc_paras["doc_id"] == doc_id]["title"].iloc[0]
 
         para_ids = doc_id_group["idx_para_matched"].unique()
         para_grouped = doc_id_group.groupby(["idx_para_matched"])
@@ -755,7 +765,9 @@ def create_squad_like_json(output_dir: str):
 ###################################################
 
 
-def generate_pdfs_images_bboxes(output_dir: str, size_factor: int = 1):
+def generate_pdfs_images_bboxes(
+    output_dir: str, image_width: Optional[int], image_height: Optional[int]
+):
     """
     Generates PDFs, images, words, bounding boxes of HTMLs in output_dir.
 
@@ -763,22 +775,22 @@ def generate_pdfs_images_bboxes(output_dir: str, size_factor: int = 1):
     :param size_factor: factor by which the HTMLs are to be zoomed while
         generating images of the webpages
     """
-    doc_data_path = os.path.join(output_dir, "doc_data.json")
-    with open(doc_data_path, "r") as f:
-        df_doc_data = pd.DataFrame.from_dict(json.load(f))
+    doc_paras_path = os.path.join(output_dir, "doc_paras.json")
+    with open(doc_paras_path, "r") as f:
+        df_doc_paras = pd.DataFrame.from_dict(json.load(f))
 
-    for doc_id in tqdm(df_doc_data["doc_id"], total=len(df_doc_data["doc_id"])):
+    for doc_id in tqdm(df_doc_paras["doc_id"], total=len(df_doc_paras["doc_id"])):
         doc_id_dir = os.path.join(output_dir, "visual_squad", str(doc_id))
-        images_dir = os.path.join(doc_id_dir, "images")
-        if not os.path.exists(images_dir):
-            os.makedirs(images_dir)
-        pdf_path = os.path.join(doc_id_dir, "pdf.pdf")
-        bboxes_path = os.path.join(doc_id_dir, "bboxes.json")
-        html_path = os.path.join(output_dir, "htmls", f"{doc_id}.html")
+        if not os.path.exists(doc_id_dir):
+            os.makedirs(doc_id_dir)
 
+        pdf_path = os.path.join(doc_id_dir, "pdf.pdf")
+        html_path = os.path.join(output_dir, "htmls", f"{doc_id}.html")
         html_to_pdf(html_path, pdf_path)
+
+        pages_dir = os.path.join(doc_id_dir, "pages")
         save_images_words_bboxes(
-            pdf_path, images_dir, bboxes_path, size_factor=size_factor
+            pdf_path, pages_dir, width=image_width, height=image_height
         )
 
 
@@ -796,254 +808,10 @@ def html_to_pdf(html_path: str, pdf_path: str):
     try:
         run(command)
     except FileNotFoundError:
-        logging.error(
+        logger.error(
             "Binary files of 'wkhtmltopdf' are missing, make sure you have installed them and set \
                       'WKHTMLTOPDF_PATH' to the path where wkhtmltopdf.exe lives."
         )
-
-
-###################################################
-# Para image assets generation
-###################################################
-
-
-def generate_para_images(dataset_dir, size_factor=1):
-    """
-    Adds "para_images" directory at each visual_squad\<doc_id>\ location with
-    following files:
-    para_images/
-        <para_id>/
-            [
-                page_width_fit_para_box.json
-                page_width_fit_para_box.png,
-                para_box.json,
-                para_box.png,
-                whole_para_page.json,
-                whole_para_page.png
-            ]
-    The 3 types of para assets (image + bounding boxes) are generated for every
-    paragraph in respective PDF:
-    - para_box: page image cropped exactly around the paragraph
-    - page_width_fit_para_box: page image cropped around the paragraph with
-        paragraph height and page width
-    - whole_para_page: page image containing the paragraph
-
-    :param output_dir: directory in which the generated visual squad data is
-        to be saved
-    :param size_factor: factor by which the PDFs are to be zoomed while
-        generating images
-    """
-    squad_like_json_path = os.path.join(dataset_dir, "squad_like_json.json")
-
-    with open(squad_like_json_path, "r") as f:
-        docs = json.load(f)
-
-    for doc_data in tqdm(docs, total=len(docs)):
-        doc_dir = os.path.join(dataset_dir, "visual_squad", str(doc_data["doc_id"]))
-        paras_dir = os.path.join(doc_dir, "para_images")
-        if os.path.exists(paras_dir):
-            shutil.rmtree(paras_dir, ignore_errors=True)
-        generate_para_images_for_doc(
-            doc_data=doc_data, doc_dir=doc_dir, size_factor=size_factor
-        )
-
-
-# helpers
-
-# FIXED LATER: not extracting images properly for size factor != 1
-def generate_para_images_for_doc(doc_data: str, doc_dir: str, size_factor: int):
-    """
-    Calls generate_para_images_for_broken_para to generate para assets for
-    paragraph that is split into 2 pages and calls generate_para_images_for_broken_para
-    to to generate para assets for paragraph that resides in a single page of
-    respective PDF.
-
-    :param doc_data: document data from squad_like_json.json
-    :param doc_dir: directory in which document PDF is present
-    :param size_factor: factor by which the PDFs are to be zoomed while
-        generating images
-    """
-    pdf_path = os.path.join(doc_dir, "pdf.pdf")
-    doc = fitz.open(pdf_path)
-
-    for para in doc_data["paragraphs"]:
-        para_found = False
-        for page_nr, page in enumerate(doc):
-            if generate_para_images_for_complete_para(
-                para["context"],
-                page,
-                para["para_id"],
-                doc_dir,
-                page_nr,
-                size_factor,
-            ):
-                para_found = True
-                break
-        # if para_found == False:
-        #     print("pages: ", doc.page_count, doc.load_page(3))
-        #     for page1_nr, page1 in enumerate(doc):
-        #         if page1_nr < doc.page_count:
-        #             if generate_para_images_for_broken_para(
-        #                 para["context"],
-        #                 doc_dir,
-        #                 para["para_id"],
-        #                 page1,
-        #                 doc.load_page(page1_nr+1),
-        #                 page1_nr,
-        #                 size_factor
-        #             ):
-        #                 break
-
-
-def generate_para_images_for_broken_para(
-    para_text, doc_dir, para_id, page1, page2, page1_nr, size_factor
-):
-    return False
-
-
-def generate_para_images_for_complete_para(
-    para_text: str,
-    page: fitz.fitz.Page,
-    para_id: int,
-    doc_dir: str,
-    page_nr: int,
-    size_factor: int,
-) -> bool:
-    """
-    Generates para assets for a paragraph residing in a single page of
-    respective PDF. The para assets are: [page_width_fit_para_box.json,
-    page_width_fit_para_box.png, para_box.json, para_box.png,
-    whole_para_page.json, whole_para_page.png]
-
-    :param para_text: paragraph text
-    :param page: page from a PDF
-    :param para_id: para_id in squad_like_json.json for the paragraph
-    :param doc_dir: directory in which generated page images folder is present
-    :param page_nr: page number in which para_text is searched
-    :param size_factor: factor by which the PDFs are to be zoomed while
-        generating images
-    :return: True if para_text is present in the page else returns False
-    """
-
-    def find_start_index(fitz_words, string) -> Union[int, None]:
-        string_words = string.split()
-        word_list = [word[4] for word in fitz_words]
-        for i in range(len(word_list)):
-            # Check if the remaining words in the word list match the string words
-            if word_list[i:] == string_words:
-                return i
-
-    matched_lines_bboxes = page.search_for(para_text, ignore_case=False)
-
-    if matched_lines_bboxes:
-        para_dir = os.path.join(doc_dir, "para_images", str(para_id))
-        if not os.path.exists(para_dir):
-            os.makedirs(para_dir)
-
-        para_box = matched_lines_bboxes[0]
-        for inst in matched_lines_bboxes[1:]:
-            para_box = para_box | inst  # union rectangle
-
-        para_box_words = page.get_text("words", clip=para_box)
-
-        match_start_index = find_start_index(para_box_words, para_text)
-
-        if match_start_index is not None:
-            matched_words = para_box_words[match_start_index:]
-
-            matched_word_tokens = [word[4] for word in matched_words]
-            matched_words_bboxes = [
-                [int(size_factor * coordinate) for coordinate in word[:4]]
-                for word in matched_words
-            ]
-            existing_page_image_path = os.path.join(doc_dir, "images", f"{page_nr}.png")
-            para_page_image = Image.open(existing_page_image_path)
-
-            # whole page
-            whole_para_page_json = os.path.join(para_dir, "whole_para_page.json")
-            whole_para_page_image_path = os.path.join(para_dir, "whole_para_page.png")
-            para_page_image.save(whole_para_page_image_path, "PNG")
-            write_word_bboxes(
-                matched_word_tokens, matched_words_bboxes, whole_para_page_json
-            )
-
-            # exact fit
-            para_box_image = para_page_image.crop(para_box)
-            para_box_json = os.path.join(para_dir, "para_box.json")
-            para_box_image_path = os.path.join(para_dir, "para_box.png")
-            para_box_image.save(para_box_image_path, "PNG")
-            matched_words_bboxes = offset_bboxes(matched_words_bboxes, para_box)
-            write_word_bboxes(matched_word_tokens, matched_words_bboxes, para_box_json)
-
-            # page width fit
-            page_width_fit_para_box_json = os.path.join(
-                para_dir, "page_width_fit_para_box.json"
-            )
-            page_width_fit_para_box_image_path = os.path.join(
-                para_dir, "page_width_fit_para_box.png"
-            )
-            page_width_fit_para_box = [
-                page.rect.x0,
-                para_box.y0,
-                page.rect.x1,
-                para_box.y1,
-            ]
-            page_width_fit_para_box_image = para_page_image.crop(
-                page_width_fit_para_box
-            )
-            page_width_fit_para_box_image.save(
-                page_width_fit_para_box_image_path, "PNG"
-            )
-            matched_words_bboxes = offset_bboxes(
-                matched_words_bboxes, page_width_fit_para_box
-            )
-            write_word_bboxes(
-                matched_word_tokens, matched_words_bboxes, page_width_fit_para_box_json
-            )
-
-        else:
-            logging.warning(
-                f"Failed to extract words from the non-rectangular para[{para_id}] in {os.path.join(doc_dir, 'pdf.pdf')}"
-            )
-
-        return True
-    else:
-        return False
-
-
-def write_word_bboxes(tokens: List[str], bboxes: List[List[int]], bboxes_path: str):
-    """
-    Saves words and their bounding boxes in a json file
-
-    :param tokens: list of words
-    :param bboxes: list of bounding boxes
-    :param bboxes_path: path of json to store the data
-    """
-    with open(bboxes_path, "a") as f:
-        json.dump({"bboxes": bboxes, "words": tokens}, f)
-
-
-def offset_bboxes(bboxes: List[List[int]], to_offset_box: List[float]):
-    """
-    Offsets bounding boxes relative to top-left corner of given
-    reference box
-
-    :param bboxes: list of bounding boxes as list of coordinates
-        of top-left and bottom-right corners
-    :param to_offset_box: list of coordinates of top-left corner of
-        reference box
-    :return: list of translated bounding boxes
-    """
-    bboxes = [
-        [
-            int(bbox[0] - to_offset_box[0]),
-            int(bbox[1] - to_offset_box[1]),
-            int(bbox[2] - to_offset_box[0]),
-            int(bbox[3] - to_offset_box[1]),
-        ]
-        for bbox in bboxes
-    ]
-    return bboxes
 
 
 ###################################################
@@ -1051,44 +819,19 @@ def offset_bboxes(bboxes: List[List[int]], to_offset_box: List[float]):
 ###################################################
 
 
-def create_preliminary_modelling_data(
-    output_dir: str,
-    max_token_length: Union[int, None] = None,
-    ignore_impossible: bool = True,
-    para_asset_type: str = "para_box",
-):
+def create_preliminary_modelling_data(output_dir: str):
     """
     Generates json files that are ingested as data to textual and multi-modal models
 
-    :param output_dir: directory in which preprocessing outputs (doc_data.json,
+    :param output_dir: directory in which preprocessing outputs (doc_paras.json,
         qas.json) exist
-    :param max_token_length: max threshold on paragraph + question length
-    :param ignore_impossible: if True, impossible questions are ignored
-    :param para_asset_type: "page_width_fit_para_box", "para_box", or "whole_para_page"
     """
-
-    def get_context(doc_id, para_id):
-        return df_doc_data[df_doc_data["doc_id"] == doc_id]["paras"].values[0][para_id]
-
-    def get_image_path(doc_id, para_id, para_asset_type):
-        relative_output_dir_path = os.path.relpath(output_dir)
-        return os.path.join(
-            os.path.join(*(relative_output_dir_path.split(os.path.sep)[1:])),
-            "visual_squad",
-            str(doc_id),
-            "para_images",
-            str(para_id),
-            f"{para_asset_type}.png",
-        )
-
-    def check_path_exists(path):
-        return os.path.exists(os.path.join(SRC_DIRECTORY, path))
 
     # Reading generated data...
 
-    doc_data_path = os.path.join(output_dir, "doc_data.json")
-    with open(doc_data_path, "r", encoding="utf-8") as f:
-        df_doc_data = pd.DataFrame.from_dict(json.load(f))
+    doc_paras_path = os.path.join(output_dir, "doc_paras.json")
+    with open(doc_paras_path, "r", encoding="utf-8") as f:
+        df_doc_paras = pd.DataFrame.from_dict(json.load(f))
 
     qas_path = os.path.join(output_dir, "qas.json")
     with open(qas_path, "r", encoding="utf-8") as f:
@@ -1099,42 +842,15 @@ def create_preliminary_modelling_data(
     # Keep only validated questions
     df_qas = df_qas[df_qas["is_validated"] == True]
 
-    if ignore_impossible:
-        # Keep only possible questions
-        df_qas = df_qas[df_qas["is_impossible"] == False]
+    # Keep only possible questions
+    df_qas = df_qas[df_qas["is_impossible"] == False]
 
-    # Check dtypes - conflicts with impossible questions
     df_qas = df_qas.astype(
         {
             "answer_start_char_idx": int,
             "answer_end_char_idx": int,
             "idx_para_matched": int,
         }
-    )
-
-    # Get contexts
-    df_qas["context"] = df_qas.apply(
-        lambda x: get_context(x["doc_id"], x["idx_para_matched"]), axis=1
-    )
-
-    # Drop rows where the combined word count is greater than max_token_length
-    if max_token_length:
-        df_qas["combined_word_count"] = (
-            df_qas["question"].str.split().str.len()
-            + df_qas["context"].str.split().str.len()
-        )
-        df_qas = df_qas[df_qas["combined_word_count"] <= max_token_length]
-        df_qas.drop(columns=["combined_word_count"], inplace=True)
-
-    # Extract image path
-    df_qas["image_path"] = df_qas.apply(
-        lambda x: get_image_path(x["doc_id"], x["idx_para_matched"], para_asset_type),
-        axis=1,
-    )
-
-    # keep rows only if corresponding para data exists
-    df_qas["path_exists"] = df_qas["image_path"].apply(
-        lambda path: check_path_exists(path)
     )
 
     # original data contains answer duplicates - drop them
@@ -1144,19 +860,27 @@ def create_preliminary_modelling_data(
         inplace=True,
     )
 
-    # keep only if corresponding image path exists => para data (.json, .png) exist
-    df_qas = df_qas.drop(df_qas[df_qas.path_exists == False].index)
-
     # drop unwanted columns
     df_qas.drop(
         columns=[
-            "path_exists",
-            "context",
             "doc_title",
             "plausible_answers",
             "percent_match",
             "is_impossible",
             "is_validated",
+        ],
+        inplace=True,
+    )
+
+    # Updating data frame...
+
+    # update start, end char positions + add image_path column
+    df_qas = updated_df_qas(df_qas, df_doc_paras, output_dir)
+
+    df_qas.drop(
+        columns=[
+            "idx_para_matched",
+            "doc_id",
         ],
         inplace=True,
     )
@@ -1170,57 +894,69 @@ def create_preliminary_modelling_data(
     refactor_json_files([modelling_data_json_path])
 
 
-###################################################
-# Answer aggregation
-###################################################
+# helpers
 
 
-def group_answers_as_lists(dataset_json_path: str):
+def updated_df_qas(df_qas: pd.DataFrame, df_doc_paras: pd.DataFrame, output_dir: str):
     """
-    Modifies input json by aggregating answers to every question as a list.
+    Updates df_qas by offsetting start, end char positions (from being w.r.t. para
+    to being w.r.t. page without \n's) and adds image_path column
 
-    :param dataset_json_path: path of input json file (modelling data)
+    :param df_qas: dataframe containing the question answer pairs
+    :param df_doc_paras: dataframe containing the document para pairs
+    :param output_dir: directory containing all Visual SQuAD data
+    :return: updated dataframe of question answer pairs
     """
+    relative_output_dir_path = os.path.relpath(output_dir)
 
-    refactor_json_files([dataset_json_path])
+    df_qas["image_path"] = None
 
-    # loading data
-    with open(dataset_json_path, "r", encoding="utf-8") as f:
-        df_qas = pd.DataFrame.from_dict(json.load(f))
+    grouped_by_doc_id = df_qas.groupby("doc_id")
 
-    # get grouped answer data
-    grouped = (
-        df_qas.groupby("qas_id")
-        .agg(
-            {
-                "answer_start_char_idx": list,
-                "answer_end_char_idx": list,
-                "answer_text": list,
-            }
+    for doc_id in df_qas["doc_id"].unique():
+        pages_dir = os.path.join(
+            os.path.join(*(relative_output_dir_path.split(os.path.sep)[1:])),
+            "visual_squad",
+            str(doc_id),
+            "pages",
         )
-        .reset_index()
-    )
+        page_nrs = [
+            dir_name for dir_name in os.listdir(os.path.join(SRC_DIRECTORY, pages_dir))
+        ]
 
-    grouped["qas_id"] = grouped["qas_id"].apply(lambda x: x[0])
+        for page_nr in page_nrs:
+            page_text_file_path = os.path.join(
+                SRC_DIRECTORY, pages_dir, page_nr, "text.txt"
+            )
 
-    # drop unwanted columns
-    df_qas.drop(
-        columns=["answer_start_char_idx", "answer_end_char_idx", "answer_text"],
-        inplace=True,
-    )
+            with open(page_text_file_path, "r", encoding="utf-8") as file:
+                page_text = file.read().replace("\n", " ")
 
-    # merging grouped answer data
-    df_qas = pd.merge(df_qas, grouped, on="qas_id")
+            para_ids = grouped_by_doc_id.get_group(doc_id)["idx_para_matched"].unique()
 
-    # drop duplicate rows
-    df_qas.drop_duplicates(["qas_id"], keep="last", inplace=True)
+            for para_id in para_ids:
+                para_text = df_doc_paras[df_doc_paras["doc_id"] == doc_id][
+                    "paras"
+                ].values[0][para_id]
+                index_matched = page_text.find(para_text)
 
-    # drop qas_id column
-    df_qas.drop(columns=["qas_id"], inplace=True)
+                if index_matched != -1:
+                    df_qas.loc[
+                        (df_qas["idx_para_matched"] == para_id)
+                        & (df_qas["doc_id"] == doc_id),
+                        "image_path",
+                    ] = os.path.join(pages_dir, page_nr, "image.png")
+                    df_qas.loc[
+                        (df_qas["idx_para_matched"] == para_id)
+                        & (df_qas["doc_id"] == doc_id),
+                        "answer_start_char_idx",
+                    ] += index_matched
+                    df_qas.loc[
+                        (df_qas["idx_para_matched"] == para_id)
+                        & (df_qas["doc_id"] == doc_id),
+                        "answer_end_char_idx",
+                    ] += index_matched
 
-    # Saving modelling data...
+    df_qas = df_qas[df_qas["image_path"].notna()]
 
-    with open(dataset_json_path, "w", encoding="utf-8") as f:
-        f.write(df_qas.to_json(orient="records", lines=True).replace("}", "},")[:-1])
-
-    refactor_json_files([dataset_json_path])
+    return df_qas
