@@ -4,7 +4,7 @@ Main project file to run experiments
 
 import torch
 import pytorch_lightning as pl
-from dataloader import SquadDataset
+from dataloader import VisualSquadDataModule
 from models import QAModel
 from pytorch_lightning.callbacks import (
     EarlyStopping,
@@ -41,7 +41,7 @@ if __name__ == "__main__":
     args, parser, accelerator = get_args()
 
     parser = pl.Trainer.add_argparse_args(parent_parser=parser, use_argument_group=True)
-    parser = SquadDataset.add_argparse_args(parser)
+    parser = VisualSquadDataModule.add_argparse_args(parser)
     parser = QAModel.add_argparse_args(parser)
 
     # Workaround to parse args from config file twice
@@ -62,9 +62,7 @@ if __name__ == "__main__":
     # Instantiate data loader
     ##################################################
 
-    pl.seed_everything(args.dataloader_seed, workers=True)
-
-    dataset = SquadDataset(
+    datamodule = VisualSquadDataModule(
         model_name=args.model_name,
         batch_size=args.batch_size,
         dev_ratio=args.dev_ratio,
@@ -77,16 +75,12 @@ if __name__ == "__main__":
         include_references=args.include_references,
         image_width=args.image_width,
         image_height=args.image_height,
+        train_data_seed=args.dataloader_seed
     )
 
-    shuffle_trainset = False if args.dataloader_seed is None else True
-
-    train_dataloader = dataset.to_dataloader("train", shuffle_trainset)
-    eval_dataloader = dataset.to_dataloader("dev")
-    test_dataloader = dataset.to_dataloader("test")
-
     # needed for initializing the Ranger21 optimizer
-    num_train_batches_per_epoch = len(train_dataloader)
+    datamodule.setup(stage="fit")
+    num_train_batches_per_epoch = len(datamodule.train_dataset.to_dataloader())
 
     ##################################################
     # Instantiate model
@@ -149,6 +143,9 @@ if __name__ == "__main__":
         ##################################################
         # Initialize trainer
         ##################################################
+
+        if args.dataloader_seed:
+            pl.seed_everything(args.dataloader_seed, workers=True)
 
         model_save_dir = os.path.join(SRC_DIRECTORY, "models", args.experiment_name)
         runs_dir = os.path.join(SRC_DIRECTORY, "runs")
@@ -216,13 +213,13 @@ if __name__ == "__main__":
         ##################################################
 
         start_time = time.time()
-        trainer.fit(model, train_dataloader, eval_dataloader)
+        trainer.fit(model, datamodule)
         train_ended_time = time.time()
         logger.info(
             f"Time taken by trainer.fit (training + validation): {datetime.timedelta(seconds = train_ended_time - start_time)}"
         )
 
-        trainer.test(model, dataloaders=test_dataloader, verbose=False, ckpt_path="best")
+        trainer.test(model, dataloaders=datamodule, verbose=False, ckpt_path="best")
         test_ended_time = time.time()
         logger.info(
             f"Time taken by trainer.test (testing): {datetime.timedelta(seconds = test_ended_time - train_ended_time)}"
@@ -231,11 +228,10 @@ if __name__ == "__main__":
 
     # Useful terminal commands to view tensorboard visualizations:
     # !tensorboard --logdir=src\runs --bind_all
-    # !tensorboard --logdir_spec=roberta:src\runs\test\version_1,llmv3:src\runs\test\version_2 --bind_all
-
+    # !tensorboard --logdir_spec=roberta:src\runs\roberta\version_1,llmv3:src\runs\llmv3\version_2 --bind_all
     # !tensorboard --logdir=./pytorch_profiler_outs --bind_all
 
-    # Windows:: For anyone else looking for a workaround:
+    # Profiler fix for Windows:: For anyone else looking for a workaround:
     # Change line 114 in '\path_to_python_installation\Lib\site-packages\torch_tb_profiler\profiler\data.py'
     # to
     # trace_json = json.loads(data.replace(b"\\", b"\\\\"), strict=False)

@@ -42,13 +42,24 @@ class QAModel(pl.LightningModule):
         log_test_every_n_steps,
         profiler,
         llmv3_checkpoint=LLMv3_BACKBONE,
-        roberta_checkpoint=RoBERTa_BACKBONE,
-        normalize: bool = False,
+        roberta_checkpoint=RoBERTa_BACKBONE
     ):
         """
-
-        Args:
-            model_name: name or path to load model from
+        :param model_name: LLMv3 or RoBERTa
+        :param max_epochs: max epochs till which training can go
+        :param num_batches_per_epoch: number of batches that the model sees in 
+            each epoch
+        :param lr: initial learning rate of the model
+        :param use_ReduceLROnPlateau: to use ReduceLROnPlateau or not
+        :param patience: patience for ReduceLROnPlateau
+        :param optimizer: adam or ranger
+        :param log_val_every_n_steps: iteratively tensorboard logging after 
+            how many validation steps the model should log
+        :param log_test_every_n_steps: iteratively tensorboard logging after 
+            how many test steps the model should log
+        :param profiler: PyTorch profiler object
+        :param llmv3_checkpoint: LLMv3 checkpoint
+        :param roberta_checkpoint: RoBERTa checkpoint
         """
         super().__init__()
 
@@ -58,7 +69,6 @@ class QAModel(pl.LightningModule):
         self.max_epochs = max_epochs
         self.optimizer = optimizer
         self.num_batches_per_epoch = num_batches_per_epoch
-        self.normalize = normalize
         self.log_val_every_n_steps = log_val_every_n_steps
         self.log_test_every_n_steps = log_test_every_n_steps
         self.count_epoch = 0
@@ -226,15 +236,6 @@ class QAModel(pl.LightningModule):
         :return: statistics (loss + metrics) of each step
         """
         target_answers, predicted_answers = self.decode_output(batch, outputs)
-
-        if self.normalize:
-            target_answers = [
-                self.normalize_text(target_answer) for target_answer in target_answers
-            ]
-            predicted_answers = [
-                self.normalize_text(predicted_answer)
-                for predicted_answer in predicted_answers
-            ]
 
         stats = self.get_all_scores(target_answers, predicted_answers)
         stats["loss"] = outputs.loss

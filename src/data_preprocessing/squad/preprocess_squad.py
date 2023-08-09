@@ -819,7 +819,7 @@ def html_to_pdf(html_path: str, pdf_path: str):
 ###################################################
 
 
-def create_preliminary_modelling_data(output_dir: str):
+def create_modelling_data(output_dir: str):
     """
     Generates json files that are ingested as data to textual and multi-modal models
 

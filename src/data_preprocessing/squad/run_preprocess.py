@@ -13,7 +13,7 @@ from preprocess_squad import (
     collect_docs,
     create_squad_like_json,
     generate_pdfs_images_bboxes,
-    create_preliminary_modelling_data,
+    create_modelling_data,
 )
 import zipfile
 import logging
@@ -127,7 +127,7 @@ def create_visual_squad(
     )
 
     logger.info("Generating jsons that are needed for modelling....")
-    create_preliminary_modelling_data(output_dir)
+    create_modelling_data(output_dir)
 
     logger.info(
         f"Completed generating Visual Squad data! The files are ready in {output_dir}"

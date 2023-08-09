@@ -25,40 +25,29 @@ from typing import Dict, Union, List, Tuple
 import configargparse
 
 
-class SquadDataset(pl.LightningDataModule):
+class VisualSquadDataset:
     def __init__(
         self,
+        dataset: Dataset,
         model_name: str,
         batch_size: int,
-        dev_ratio: float,
-        test_ratio: float,
-        split_seed: int,
         tokenizer_max_length: int,
         tokenizer_stride: int,
         num_workers: int,
         is_layout_dependent: bool,
-        include_references: bool,
-        image_width: Union[int, None],
-        image_height: Union[int, None],
-        dataset_dir: str = V_SQUAD_DIR,
         llmv3_checkpoint: str = LLMv3_BACKBONE,
-        roberta_checkpoint: str = RoBERTa_BACKBONE,
+        roberta_checkpoint: str = RoBERTa_BACKBONE
     ):
         """
+        :param dataset: train/val/test Dataset
         :param model_name: LLMv3 or RoBERTa
         :param batch_size: size of batches outputted by dataloader
-        :param dev_ratio: Validation set to total dataset size ratio
-        :param test_ratio: Test set to total dataset size ratio
-        :param split_seed: seed of randomness in splitting the dataset
         :param tokenizer_max_length: max_length used for tokenizing each question-
             answer while offsetting answer positions
         :param tokenizer_stride: stride for while tokenizing each question-answer
             while offsetting answer positions
         :param num_workers: number of workers in dataloader to parallel process
         :param is_layout_dependent: whether RoBERTa should know the layout by \n's
-        :param include_references: to include citation numbers from webpages or not
-        :param image_size: size to which images are to be resized
-        :param dataset_dir: directory in which dataset files live
         :param llmv3_checkpoint: LLMv3 checkpoint for tokenizing and processing
         :param roberta_checkpoint: RoBERTa checkpoint for tokenizing
         """
@@ -66,28 +55,11 @@ class SquadDataset(pl.LightningDataModule):
         super().__init__()
 
         self.batch_size = batch_size
-        self.dev_ratio = dev_ratio
-        self.test_ratio = test_ratio
         self.tokenizer_max_length = tokenizer_max_length
         self.tokenizer_stride = tokenizer_stride
         self.num_workers = num_workers
         self.is_layout_dependent = is_layout_dependent
-
-        self.dataset_dir = dataset_dir
-        self.dataset_json_path = os.path.join(self.dataset_dir, "modelling_data.json")
-
-        if not os.path.exists(self.dataset_json_path):
-            self.create_dataset(
-                doc_limit=2,
-                include_references=include_references,
-                zip_path=None,
-                image_width=image_width,
-                image_height=image_height
-            )
-
-        self.dataset = self.load_dataset()
-        self.split_seed = split_seed
-        self.splitted_dataset = self.split_data()
+        self.dataset = dataset
 
         if model_name == "LLMv3":
             self.llmv3_tokenizer = LayoutLMv3TokenizerFast.from_pretrained(
@@ -109,54 +81,6 @@ class SquadDataset(pl.LightningDataModule):
                 f"choose one of 'LLMv3' or 'RoBERTa'"
             )
 
-    ###################################################
-    # Dataset creation
-    ###################################################
-
-    @staticmethod
-    def create_dataset(
-        data_paths: List[str] = [TRAINSET_PATH, DEVSET_PATH],
-        output_dir: str = V_SQUAD_DIR,
-        doc_limit: Union[int, None] = DOC_LIMIT,
-        zip_path: Union[str, None] = ZIP_PATH,
-        html_version: str = "2017",
-        threshold_min: int = 1,
-        threshold_max: int = 1,
-        image_width: Union[int, None] = None,
-        image_height: Union[int, None] = None,
-        include_references: bool = False,
-    ):
-        """
-        Calls create_visual_squad from src\data_preprocessing\squad\run_preprocess.py to create
-        visual squad dataset.
-        """
-        data = list()
-        for data_path in data_paths:
-            data.extend(squad_load(data_path))
-
-        create_visual_squad(
-            data=data,
-            output_dir=output_dir,
-            doc_limit=doc_limit,
-            zip_path=zip_path,
-            html_version=html_version,
-            threshold_min=threshold_min,
-            threshold_max=threshold_max,
-            image_width=image_width,
-            image_height=image_height,
-            include_references=include_references,
-        )
-
-    ###################################################
-    # Loading dataset
-    ###################################################
-
-    def load_dataset(self) -> Dataset:
-        """
-        Loads dataset from input dataset json file.
-        """
-        return Dataset.from_json(self.dataset_json_path)
-
     def __getitem__(self, index: int) -> Dict:
         """
         Gets one item from dataset using its index.
@@ -169,42 +93,16 @@ class SquadDataset(pl.LightningDataModule):
         """
         return len(self.dataset)
 
-    def split_data(self) -> Dict[str, Dataset]:
-        """
-        Splits input dataset and returns dictionary of Dataset objects for train, dev, test.
-        """
-        # No shuffle
-        if self.split_seed is None:
-            rest_and_test = self.dataset.train_test_split(
-                test_size=self.test_ratio, shuffle=False
-            )
-            train_dev = rest_and_test["train"].train_test_split(
-                test_size=self.dev_ratio / (1 - self.test_ratio), shuffle=False
-            )
-        # With shuffling
-        else:
-            rest_and_test = self.dataset.train_test_split(
-                test_size=self.test_ratio, seed=self.split_seed
-            )
-            train_dev = rest_and_test["train"].train_test_split(
-                test_size=self.dev_ratio / (1 - self.test_ratio), seed=self.split_seed
-            )
-        return {
-            "train": train_dev["train"],
-            "dev": train_dev["test"],
-            "test": rest_and_test["test"],
-        }
-
     ###################################################
     # Dataloader
     ###################################################
 
-    def to_dataloader(self, split_name: str, shuffle: bool = False) -> DataLoader:
+    def to_dataloader(self, shuffle: bool = False) -> DataLoader:
         """
         Returns data as torch DataLoader object for given split (train/dev/test).
         """
         return DataLoader(
-            self.splitted_dataset[split_name],
+            self.dataset,
             batch_size=self.batch_size,
             shuffle=shuffle,
             drop_last=False,
@@ -255,6 +153,7 @@ class SquadDataset(pl.LightningDataModule):
             questions,
             contexts,
             max_length=self.tokenizer_max_length,
+            stride=self.tokenizer_stride,
             truncation="only_second",
             return_overflowing_tokens=True,
             return_offsets_mapping=True,
@@ -314,6 +213,7 @@ class SquadDataset(pl.LightningDataModule):
             words,
             boxes=bboxes,
             max_length=self.tokenizer_max_length,
+            stride=self.tokenizer_stride,
             truncation="only_second",
             return_overflowing_tokens=True,
             return_offsets_mapping=True,
@@ -351,7 +251,9 @@ class SquadDataset(pl.LightningDataModule):
 
         return encoding
 
-    # Helper functions...
+    ###################################################
+    # Helper functions
+    ###################################################
 
     @staticmethod
     def corrected_llmv3_offsets(
@@ -488,6 +390,202 @@ class SquadDataset(pl.LightningDataModule):
                 break
 
         return string2_index
+    
+
+class VisualSquadDataModule(pl.LightningDataModule):
+    def __init__(
+        self,
+        model_name: str,
+        batch_size: int,
+        dev_ratio: float,
+        test_ratio: float,
+        split_seed: int,
+        tokenizer_max_length: int,
+        tokenizer_stride: int,
+        num_workers: int,
+        is_layout_dependent: bool,
+        include_references: bool,
+        image_width: Union[int, None],
+        image_height: Union[int, None],
+        dataset_dir: str = V_SQUAD_DIR,
+        train_data_seed: Union[int, None] = None
+    ):
+        """
+        :param model_name: LLMv3 or RoBERTa
+        :param batch_size: size of batches outputted by dataloader
+        :param dev_ratio: Validation set to total dataset size ratio
+        :param test_ratio: Test set to total dataset size ratio
+        :param split_seed: seed of randomness in splitting the dataset
+        :param tokenizer_max_length: max_length used for tokenizing each question-
+            answer while offsetting answer positions
+        :param tokenizer_stride: stride for while tokenizing each question-answer
+            while offsetting answer positions
+        :param num_workers: number of workers in dataloader to parallel process
+        :param is_layout_dependent: whether RoBERTa should know the layout by \n's
+        :param include_references: to include citation numbers from webpages or not
+        :param image_size: size to which images are to be resized
+        :param dataset_dir: directory in which dataset files live
+        :param train_data_seed: seed with which train dataloader should shuffle
+        """
+
+        super().__init__()
+
+        self.batch_size = batch_size
+        self.dev_ratio = dev_ratio
+        self.test_ratio = test_ratio
+        self.tokenizer_max_length = tokenizer_max_length
+        self.tokenizer_stride = tokenizer_stride
+        self.num_workers = num_workers
+        self.is_layout_dependent = is_layout_dependent
+        self.model_name = model_name
+        self.train_data_seed = train_data_seed
+
+        self.dataset_dir = dataset_dir
+        self.dataset_json_path = os.path.join(self.dataset_dir, "modelling_data.json")
+
+        if not os.path.exists(self.dataset_json_path):
+            self.create_dataset(
+                doc_limit=2,
+                include_references=include_references,
+                zip_path=None,
+                image_width=image_width,
+                image_height=image_height
+            )
+
+        self.dataset = self.load_dataset()
+        self.split_seed = split_seed
+        self.splitted_dataset = self.split_data()
+
+    ###################################################
+    # Dataset creation
+    ###################################################
+
+    @staticmethod
+    def create_dataset(
+        data_paths: List[str] = [TRAINSET_PATH, DEVSET_PATH],
+        output_dir: str = V_SQUAD_DIR,
+        doc_limit: Union[int, None] = DOC_LIMIT,
+        zip_path: Union[str, None] = ZIP_PATH,
+        html_version: str = "2017",
+        threshold_min: int = 1,
+        threshold_max: int = 1,
+        image_width: Union[int, None] = None,
+        image_height: Union[int, None] = None,
+        include_references: bool = False,
+    ):
+        """
+        Calls create_visual_squad from src\data_preprocessing\squad\run_preprocess.py to create
+        visual squad dataset.
+        """
+        data = list()
+        for data_path in data_paths:
+            data.extend(squad_load(data_path))
+
+        create_visual_squad(
+            data=data,
+            output_dir=output_dir,
+            doc_limit=doc_limit,
+            zip_path=zip_path,
+            html_version=html_version,
+            threshold_min=threshold_min,
+            threshold_max=threshold_max,
+            image_width=image_width,
+            image_height=image_height,
+            include_references=include_references,
+        )
+
+    ###################################################
+    # Loading dataset
+    ###################################################
+
+    def load_dataset(self) -> Dataset:
+        """
+        Loads dataset from input dataset json file.
+        """
+        return Dataset.from_json(self.dataset_json_path)
+
+    def split_data(self) -> Dict[str, Dataset]:
+        """
+        Splits input dataset and returns dictionary of Dataset objects for train, dev, test.
+        """
+        # No shuffle
+        if self.split_seed is None:
+            rest_and_test = self.dataset.train_test_split(
+                test_size=self.test_ratio, shuffle=False
+            )
+            train_dev = rest_and_test["train"].train_test_split(
+                test_size=self.dev_ratio / (1 - self.test_ratio), shuffle=False
+            )
+        # With shuffling
+        else:
+            rest_and_test = self.dataset.train_test_split(
+                test_size=self.test_ratio, seed=self.split_seed
+            )
+            train_dev = rest_and_test["train"].train_test_split(
+                test_size=self.dev_ratio / (1 - self.test_ratio), seed=self.split_seed
+            )
+        return {
+            "train": train_dev["train"],
+            "val": train_dev["test"],
+            "test": rest_and_test["test"],
+        }
+
+    def setup(self, stage=None):
+        """
+        Initialize object detection datasets distinguished into datasets during fitting proces and testing proces.
+        """
+        if stage == "fit":
+            self.train_dataset = VisualSquadDataset(
+                dataset=self.splitted_dataset["train"],
+                model_name=self.model_name,
+                batch_size=self.batch_size,
+                tokenizer_max_length=self.tokenizer_max_length,
+                tokenizer_stride=self.tokenizer_stride,
+                num_workers=self.num_workers,
+                is_layout_dependent=self.is_layout_dependent
+            )
+            self.val_dataset = VisualSquadDataset(
+                dataset=self.splitted_dataset["val"],
+                model_name=self.model_name,
+                batch_size=self.batch_size,
+                tokenizer_max_length=self.tokenizer_max_length,
+                tokenizer_stride=self.tokenizer_stride,
+                num_workers=self.num_workers,
+                is_layout_dependent=self.is_layout_dependent
+            )
+        if stage == "test":
+            self.test_dataset = VisualSquadDataset(
+                dataset=self.splitted_dataset["test"],
+                model_name=self.model_name,
+                batch_size=self.batch_size,
+                tokenizer_max_length=self.tokenizer_max_length,
+                tokenizer_stride=self.tokenizer_stride,
+                num_workers=self.num_workers,
+                is_layout_dependent=self.is_layout_dependent
+            )
+  
+    ###################################################
+    # Dataloaders
+    ###################################################
+
+    def train_dataloader(self) -> DataLoader:
+        """
+        Calls to_dataloader function that wraps data into dataloader object for training set.
+        """
+        shuffle_trainset = False if self.train_data_seed is None else True
+        return self.train_dataset.to_dataloader(shuffle=shuffle_trainset)
+
+    def val_dataloader(self) -> DataLoader:
+        """
+        Calls to_dataloader function that wraps data into dataloader object for validation set.
+        """
+        return self.val_dataset.to_dataloader()
+
+    def test_dataloader(self) -> DataLoader:
+        """
+        Calls to_dataloader function that wraps data into dataloader object for test set.
+        """
+        return self.test_dataset.to_dataloader()
 
     ###################################################
     # Arguments
