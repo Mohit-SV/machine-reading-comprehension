@@ -1,4 +1,4 @@
-# Visual SQuAD Long document QA: Page-text, Page-image 
+# Document Question-Answering on VisualSQuAD: Page-text, Page-image 
 
 **What work has been done?**
 
