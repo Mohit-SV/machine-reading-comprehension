@@ -124,7 +124,6 @@ if __name__ == "__main__":
             optimizer=args.optimizer,
             log_val_every_n_steps=args.log_val_every_n_steps,
             log_test_every_n_steps=args.log_test_every_n_steps,
-            normalize=False,
             profiler=prof
         )
 
