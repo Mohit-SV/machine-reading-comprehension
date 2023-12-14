@@ -35,6 +35,7 @@ class VisualSquadDataset:
         tokenizer_stride: int,
         num_workers: int,
         is_layout_dependent: bool,
+        llmv3_correction,
         llmv3_checkpoint: str = LLMv3_BACKBONE,
         roberta_checkpoint: str = RoBERTa_BACKBONE
     ):
@@ -60,6 +61,7 @@ class VisualSquadDataset:
         self.num_workers = num_workers
         self.is_layout_dependent = is_layout_dependent
         self.dataset = dataset
+        self.llmv3_correction = llmv3_correction
 
         if model_name == "LLMv3":
             self.llmv3_tokenizer = LayoutLMv3TokenizerFast.from_pretrained(
@@ -72,6 +74,7 @@ class VisualSquadDataset:
                 self.image_feature_extractor, self.llmv3_tokenizer
             )
             self._prepare_examples = self.prepare_LLMv3_examples
+            self.tokenizer_roberta = RobertaTokenizerFast.from_pretrained(roberta_checkpoint)
         elif model_name == "RoBERTa":
             self.tokenizer = RobertaTokenizerFast.from_pretrained(roberta_checkpoint)
             self._prepare_examples = self.prepare_RoBERTa_examples
@@ -164,7 +167,7 @@ class VisualSquadDataset:
         (
             encoding["start_positions"],
             encoding["end_positions"],
-        ) = self._to_token_positions(tokenized_input, examples)
+        ) = self._to_token_positions(tokenized_input, examples, tokenized_input["offset_mapping"])
         encoding.update(tokenized_input)
 
         encoding = {key: torch.LongTensor(value) for key, value in encoding.items()}
@@ -179,6 +182,15 @@ class VisualSquadDataset:
         ]
 
         return encoding
+    
+    @staticmethod    
+    def normalize_bbox(bbox, width, height):
+        return [
+             int(1000 * (bbox[0] / 224)),
+             int(1000 * (bbox[1] / 224)),
+             int(1000 * (bbox[2] / 224)),
+             int(1000 * (bbox[3] / 224)),
+         ]
 
     def prepare_LLMv3_examples(
         self, examples: List[Dict[str, Union[str, int]]]
@@ -191,21 +203,43 @@ class VisualSquadDataset:
             encoded pixel values, overflow_to_sample_mapping, start_positions and end_positions.
         """
 
-        words, bboxes, images, questions = list(), list(), list(), list()
+        words, bboxes, images, questions, contexts = list(), list(), list(), list(), list()
+
+        for example in examples:
+            questions.append(example["question"].strip())
+            text_file_path = os.path.join(
+                SRC_DIRECTORY, example["image_path"].replace("image.png", "text.txt")
+            )
+            with open(text_file_path, "r", encoding="utf-8") as file:
+                contexts.append(file.read().replace("\n", " "))
+
+        tokenized_input_roberta = self.tokenizer_roberta(
+            questions,
+            contexts,
+            max_length=self.tokenizer_max_length,
+            stride=self.tokenizer_stride,
+            truncation="only_second",
+            return_overflowing_tokens=False,
+            return_offsets_mapping=True,
+            padding="max_length",
+        )
+
+        offset_mapping = tokenized_input_roberta["offset_mapping"]
+
+        del tokenized_input_roberta, contexts
 
         for example in examples:
             images.append(
                 Image.open(os.path.join(SRC_DIRECTORY, example["image_path"]))
             )
-            questions.append(example["question"].strip())
-
             word_bboxes_path = os.path.join(
                 SRC_DIRECTORY, example["image_path"].replace("image.png", "bboxes.json")
             )
             with open(word_bboxes_path, "r", encoding="utf-8") as f:
                 word_bboxes = json.load(f)
+            bboxes = [self.normalize_bbox(bbox) for bbox in word_bboxes["bboxes"]]
             words.append(word_bboxes["words"])
-            bboxes.append(word_bboxes["bboxes"])
+            bboxes.append(bboxes)
 
         tokenized_input = self.tokenizer(
             images,
@@ -216,22 +250,23 @@ class VisualSquadDataset:
             stride=self.tokenizer_stride,
             truncation="only_second",
             return_overflowing_tokens=True,
-            return_offsets_mapping=True,
+            return_offsets_mapping=False,
             padding="max_length",
         )
-
-        tokenized_input["offset_mapping"] = [
-            self.corrected_llmv3_offsets(
-                offsets, tokenized_input.word_ids(i), self.tokenizer_max_length
-            )
-            for i, offsets in enumerate(tokenized_input["offset_mapping"])
-        ]
+        
+        # if self.llmv3_correction:
+        #     tokenized_input["offset_mapping"] = [
+        #         self.corrected_llmv3_offsets(
+        #             offsets, tokenized_input.word_ids(i), self.tokenizer_max_length
+        #         )
+        #         for i, offsets in enumerate(tokenized_input["offset_mapping"])
+        #     ]
 
         encoding = {}
         (
             encoding["start_positions"],
             encoding["end_positions"],
-        ) = self._to_token_positions(tokenized_input, examples)
+        ) = self._to_token_positions(tokenized_input, examples, offset_mapping)
         encoding.update(tokenized_input)
 
         for key, value in encoding.items():
@@ -305,6 +340,7 @@ class VisualSquadDataset:
     def _to_token_positions(
         tokenized_examples: Dict[str, torch.Tensor],
         input_examples: List[Dict[str, Union[str, int]]],
+        offset_mapping
     ) -> Tuple[List[int]]:
         """
         Returns answer start and end token indices in model input sequence using
@@ -318,7 +354,6 @@ class VisualSquadDataset:
             - list of answer end token indices in given batch
         """
         sample_mapping = tokenized_examples["overflow_to_sample_mapping"]
-        offset_mapping = tokenized_examples["offset_mapping"]
         cls_index = 0
         n_spans = len(sample_mapping)
         start_positions = [cls_index] * n_spans
@@ -407,6 +442,9 @@ class VisualSquadDataModule(pl.LightningDataModule):
         include_references: bool,
         image_width: Union[int, None],
         image_height: Union[int, None],
+        percent,
+        n_spans,
+        llmv3_correction,
         dataset_dir: str = V_SQUAD_DIR,
         train_data_seed: Union[int, None] = None
     ):
@@ -441,18 +479,22 @@ class VisualSquadDataModule(pl.LightningDataModule):
         self.train_data_seed = train_data_seed
 
         self.dataset_dir = dataset_dir
-        self.dataset_json_path = os.path.join(self.dataset_dir, "modelling_data.json")
+        self.fitting_dataset_json_path = os.path.join(self.dataset_dir, f"final_data_{n_spans}spans", f"modelling_fitting_data_{percent}.json")
+        self.test_dataset_json_path = os.path.join(self.dataset_dir, f"final_data_{n_spans}spans", f"modelling_test_data.json")
+        
+        self.llmv3_correction=llmv3_correction
 
-        if not os.path.exists(self.dataset_json_path):
-            self.create_dataset(
-                doc_limit=2,
-                include_references=include_references,
-                zip_path=None,
-                image_width=image_width,
-                image_height=image_height
-            )
+        # if not os.path.exists(self.dataset_json_path):
+        #     self.create_dataset(
+        #         doc_limit=2,
+        #         include_references=include_references,
+        #         zip_path=None,
+        #         image_width=image_width,
+        #         image_height=image_height
+        #     )
 
-        self.dataset = self.load_dataset()
+        self.fitting_dataset = self.load_dataset(self.fitting_dataset_json_path)
+        self.test_dataset = self.load_dataset(self.test_dataset_json_path)
         self.split_seed = split_seed
         self.splitted_dataset = self.split_data()
 
@@ -498,11 +540,12 @@ class VisualSquadDataModule(pl.LightningDataModule):
     # Loading dataset
     ###################################################
 
-    def load_dataset(self) -> Dataset:
+    @staticmethod
+    def load_dataset(data_path) -> Dataset:
         """
         Loads dataset from input dataset json file.
         """
-        return Dataset.from_json(self.dataset_json_path)
+        return Dataset.from_json(data_path)
 
     def split_data(self) -> Dict[str, Dataset]:
         """
@@ -510,24 +553,17 @@ class VisualSquadDataModule(pl.LightningDataModule):
         """
         # No shuffle
         if self.split_seed is None:
-            rest_and_test = self.dataset.train_test_split(
-                test_size=self.test_ratio, shuffle=False
-            )
-            train_dev = rest_and_test["train"].train_test_split(
-                test_size=self.dev_ratio / (1 - self.test_ratio), shuffle=False
+            train_dev = self.fitting_dataset.train_test_split(
+                test_size=self.dev_ratio, shuffle=False
             )
         # With shuffling
         else:
-            rest_and_test = self.dataset.train_test_split(
-                test_size=self.test_ratio, seed=self.split_seed
-            )
-            train_dev = rest_and_test["train"].train_test_split(
-                test_size=self.dev_ratio / (1 - self.test_ratio), seed=self.split_seed
+            train_dev = self.fitting_dataset.train_test_split(
+                test_size=self.dev_ratio, seed=self.split_seed
             )
         return {
             "train": train_dev["train"],
-            "val": train_dev["test"],
-            "test": rest_and_test["test"],
+            "val": train_dev["test"]
         }
 
     def setup(self, stage=None):
@@ -542,7 +578,8 @@ class VisualSquadDataModule(pl.LightningDataModule):
                 tokenizer_max_length=self.tokenizer_max_length,
                 tokenizer_stride=self.tokenizer_stride,
                 num_workers=self.num_workers,
-                is_layout_dependent=self.is_layout_dependent
+                is_layout_dependent=self.is_layout_dependent,
+                llmv3_correction=self.llmv3_correction
             )
             self.val_dataset = VisualSquadDataset(
                 dataset=self.splitted_dataset["val"],
@@ -551,17 +588,19 @@ class VisualSquadDataModule(pl.LightningDataModule):
                 tokenizer_max_length=self.tokenizer_max_length,
                 tokenizer_stride=self.tokenizer_stride,
                 num_workers=self.num_workers,
-                is_layout_dependent=self.is_layout_dependent
+                is_layout_dependent=self.is_layout_dependent,
+                llmv3_correction=self.llmv3_correction
             )
         if stage == "test":
             self.test_dataset = VisualSquadDataset(
-                dataset=self.splitted_dataset["test"],
+                dataset=self.test_dataset,
                 model_name=self.model_name,
                 batch_size=self.batch_size,
                 tokenizer_max_length=self.tokenizer_max_length,
                 tokenizer_stride=self.tokenizer_stride,
                 num_workers=self.num_workers,
-                is_layout_dependent=self.is_layout_dependent
+                is_layout_dependent=self.is_layout_dependent,
+                llmv3_correction=self.llmv3_correction
             )
   
     ###################################################
@@ -610,6 +649,18 @@ class VisualSquadDataModule(pl.LightningDataModule):
             type=str,
             default="2017",
             help="Version of wiki articles to scrape: 2017 or online.",
+        )
+        parser.add_argument(
+            "--percent",
+            type=int,
+            default=1,
+            help="percentage of fitting data.",
+        )
+        parser.add_argument(
+            "--n_spans",
+            type=int,
+            default=14,
+            help="n spans.",
         )
         parser.add_argument(
             "--threshold_min",
@@ -688,5 +739,11 @@ class VisualSquadDataModule(pl.LightningDataModule):
             action="store_true",
             default=True,
             help="Should RoBERTa know the layout by \\n's.",
+        )
+        parser.add_argument(
+            "--llmv3_correction",
+            action="store_true",
+            default=False,
+            help="llmv3_correction.",
         )
         return parent_parser
